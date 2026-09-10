@@ -1,0 +1,4 @@
+interface:
+  display_name: "设计素材拆分"
+  short_description: "拆分素材拼版，输出透明 PNG，并整理修补和人工处理任务"
+  default_prompt: "使用 $design-asset-extractor 拆分这些素材图，保留可复用组合，并检查透明背景和边缘。"
