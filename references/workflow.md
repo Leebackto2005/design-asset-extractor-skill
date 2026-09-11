@@ -1,39 +1,74 @@
-# 计划和命令
+# 执行接口
 
-脚本为 `scripts/asset_job.py`，路径需按当前 Skill 安装位置展开并加引号。
+脚本 `scripts/asset_job.py` 需要 Pillow、NumPy、OpenCV，使用本机已安装环境。所有路径按实际 Skill 所在位置展开。无需 OpenAI SDK 或 API Key。
+
+## 自动发现与计划
+
+```text
+python asset_job.py inventory --input 图片.png 或文件夹 --output 新目录/inventory.json
+```
+
+支持多个图片/文件夹输入，文件夹仅扫描当前层。inventory 只枚举，不伪装成视觉发现；Codex 随后逐张查看 source 原图，自动写新的 plan.json：
 
 ```json
 {
-  "sources": [{"id": "sheet_01", "path": "C:/images/sheet.png"}],
+  "sources": [{"id": "source_001", "path": "C:/images/master.png"}],
+  "discovery": {
+    "provider": "codex-vision", "status": "complete",
+    "coverage_notes": "逐区复查完整主体，保留花叶组合",
+    "excluded": ["无独立复用价值的散落小水滴"]
+  },
   "candidates": [{
-    "id": "sheet_01_ring", "source_id": "sheet_01", "label": "渐变圆环",
-    "bbox": [500, 970, 805, 1300], "route": "AUTO",
-    "reason": "不透明独立圆环，米白平底",
-    "background_rgb": [248, 245, 238],
-    "background_points": [[645, 1135]]
+    "id": "source_001_turtle", "source_id": "source_001", "label": "海龟",
+    "bbox": [380, 340, 790, 700], "route": "B",
+    "reason": "主体完整，渐变天空不适合平底法", "repair_mode": "extract",
+    "repair_prompt": "仅分离海龟，保持姿态、龟壳纹路、鳍和头部，移除周围背景及其他元素。"
   }]
 }
 ```
 
-- ID 仅 ASCII 字母、数字、下划线、连字符，任务内唯一；label 可中文。计划包含每张源图，脚本逐个复制为 PNG 并记录原路径、SHA-256。
-- bbox 为源图像素 `[left,top,right,bottom]`，右/下边界不包含。
-- AUTO 必填实际采样的 background_rgb。background_points 使用源图坐标，标记与外围不连通但确实应透明的空隙；不要指向卡片内容或高光。
-- 颜色距离是 RGB 欧氏距离，8 以下透明，36 以上不作为背景。边缘结合邻近不透明前景估计覆盖率并去背景色；只是均匀背景启发式，不是质量分。
-- 可选 foreground_points 使用源图坐标标记要保留的前景连通区域，排除裁切框内旁边的素材；多组件组合每个组件都要标记。不提供时保留所有前景。不能分开已经粘连的对象。
-- IMAGE2 必填具体 repair_prompt 和 reason。例如“移除前方彩带，补全黄色太阳被遮挡部分，保持已有风格、颜色、轮廓，不新增元素，使用均匀背景并留边”。MANUAL 只需原因。
+ID 仅 ASCII 字母、数字、下划线、连字符且唯一。bbox=[left,top,right,bottom]，右下不包含，基于 EXIF 校正后源图。route 接受 A/B/C 或旧 AUTO/IMAGE2/MANUAL，存储兼容旧名称。B 必填具体 repair_prompt；repair_mode 为 extract 或 complete。repair_allowed=false 禁止失败后生成式回退。
+
+A 必填采样 background_rgb，可选 background_points 标记真实内孔，可选 foreground_points 选择目标连通组件。脚本保留不与背景连通的内部浅色内容。颜色阈值仅为平底启发式，不代表质量评分。
 
 ```text
 python asset_job.py build --plan plan.json --job 新任务目录
-python asset_job.py review --job 任务目录 --id sheet_01_ring --decision accept --note "已查看深浅底，轮廓和空隙完整，无可见残留"
-python asset_job.py review --job 任务目录 --id sheet_01_ring --decision reject --note "边缘残留背景色"
-python asset_job.py repaired --job 任务目录 --id sheet_01_sun --input 修补图.png --background 248 245 238
-python asset_job.py self-test
+python asset_job.py repair-queue --job 任务目录
+python asset_job.py repair-start --job 任务目录 --id source_001_turtle
 ```
 
-review 的 --id 可传多个，但仅对实际逐一查看的素材使用。repaired 用重复的 `--point x y` 标记回图空隙（回图坐标）。本版只接收首次回图，第二轮另建任务，避免覆盖历史。
+build 不调用内置工具；队列由 Codex 继续执行。每次新建任务避免覆盖旧来源。A 数据检查失败会带原因进入 B；非处理错误仍为 ERROR，不混同人工判断。
 
-目录：source 原图副本、candidates 裁切、masks Alpha、review 待验收 PNG、previews 三联图和总览、assets 通过、review_image2 修补包、manual 人工任务、rejected 拒绝、repaired 回图，以及 manifest.json。
+## 内置工具调用与结果导入
 
-状态：REVIEW、PASS、WAITING_REPAIR、MANUAL、REJECTED、ERROR。只有 PASS 计入可用输出。build 单个候选处理失败会记录并继续，最终退出码非零；脚本不会自己发现或语义分流候选。
+repair-queue 返回候选参考图绝对路径和 prompt。repair-start 返回本次固定提示词并将状态置为 REPAIRING。随后 Codex 用 image_gen 调用一次，当前工具 schema 为准，不添加 model 等未开放参数。
 
-使用自然语言或 `$design-asset-extractor` 调用；方案中的 `/extract-assets` 不是已注册命令。
+```text
+python asset_job.py repair-result --job 任务目录 --id source_001_turtle --input 工具实际返回文件.png
+python asset_job.py review --job 任务目录 --id source_001_turtle --decision accept --note "对照原图及深浅底：主体完整，风格保持，无背景残留"
+```
+
+仅工具实际返回模型信息时加 --model；工具结果 ID 可用 --tool-reference 记录。图片先复制到 repaired/id-attempt-N.png，透明检查通过后写 review、masks、previews，等视觉复核放行。已有 Alpha 原样保留。没有真实透明、主体被裁切或全透明均不通过；第一次回到队列，第二次转人工。
+
+视觉不合格用 review --decision reject --note 具体问题；保留拒绝文件，最多再修一次。某次调用中断或返回不明：
+
+```text
+python asset_job.py repair-result --job 任务目录 --id source_001_turtle --failure "工具超时，是否生成未知"
+```
+
+置 REPAIR_BLOCKED，退出码 2。先查原调用结果，找到真实文件可对同次请求重新 repair-result --input，不发送重复请求。本版没有自动恢复一个未知外部调用的接口。
+
+旧 repaired 子命令保留为手动网页回图兼容入口，要求 --background；新的内置路线用 repair-result，以免破坏原生透明通道。
+
+## 记录与检查
+
+manifest 的 repair_attempts 保存每次 prompt、provider、model、工具引用、来源和 SHA-256。model=null 表示工具没有明确披露，不代表特定 Images 型号。generated_repair=true 表示图像模型处理，哪怕是 extract 也不能说像素未变。
+
+状态：REVIEW、PASS、WAITING_REPAIR、REPAIRING、REPAIR_BLOCKED、MANUAL、REJECTED、ERROR。只有 PASS 进入 assets。旧诊断任务不会被自动迁移或改写。
+
+```text
+python asset_job.py self-test
+python scripts/test_workflow.py
+```
+
+自检验证程序与状态，不证明模型质量。真实调用必须另查工具结果和输出图像。`/extract-assets` 未注册；用户直接用自然语言或 `$design-asset-extractor`。

@@ -1,4 +1,4 @@
-"""Flat-background asset jobs. Codex supplies the visual plan and review."""
+"""Candidate discovery handoff, A/B/C routing, built-in image repair and review."""
 import argparse
 import hashlib
 import json
@@ -30,7 +30,7 @@ def identifier(value):
 def save_manifest(job, manifest):
     manifest['updated_at'] = datetime.now(timezone.utc).isoformat()
     manifest['counts'] = {s: sum(a['status'] == s for a in manifest['assets'])
-                          for s in ['REVIEW', 'PASS', 'WAITING_REPAIR', 'MANUAL', 'REJECTED', 'ERROR']}
+                          for s in ['REVIEW', 'PASS', 'WAITING_REPAIR', 'REPAIRING', 'REPAIR_BLOCKED', 'MANUAL', 'REJECTED', 'ERROR']}
     tmp = job / 'manifest.tmp'
     tmp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
     tmp.replace(job / 'manifest.json')
@@ -118,8 +118,9 @@ def preview(source, output, target):
     canvas = Image.new('RGB', (900, 350), '#dddddd')
     draw = ImageDraw.Draw(canvas)
     for i, (label, backdrop) in enumerate([('SOURCE', '#ffffff'), ('LIGHT', '#f4f4f4'), ('DARK', '#242932')]):
-        base = Image.new('RGBA', source.size, backdrop)
-        base.alpha_composite(source if i == 0 else output)
+        item = source if i == 0 else output
+        base = Image.new('RGBA', item.size, backdrop)
+        base.alpha_composite(item)
         small = ImageOps.contain(base.convert('RGB'), (300, 320))
         canvas.paste(small, (i * 300 + (300 - small.width) // 2, 25 + (320 - small.height) // 2))
         draw.text((i * 300 + 10, 7), label, fill='black')
@@ -160,6 +161,7 @@ def validate_plan(plan, base):
         path = (base / path).resolve() if not path.is_absolute() else path.resolve()
         sources[sid] = (path, read_image(path).size)
     for a in plan['candidates']:
+        a['route'] = {'A': 'AUTO', 'B': 'IMAGE2', 'C': 'MANUAL'}.get(a.get('route'), a.get('route'))
         aid = identifier(a['id'])
         if aid in ids:
             raise ValueError('Duplicate asset ID')
@@ -180,6 +182,8 @@ def validate_plan(plan, base):
                     raise ValueError('Invalid background point')
         if a['route'] == 'IMAGE2' and not a.get('repair_prompt'):
             raise ValueError('IMAGE2 needs a specific repair_prompt')
+        if a.get('repair_mode', 'extract') not in ('extract', 'complete'):
+            raise ValueError('repair_mode must be extract or complete')
     if not sources or not ids:
         raise ValueError('Plan must contain sources and candidates')
     return sources
@@ -193,12 +197,15 @@ def build(args):
     job.mkdir(parents=True, exist_ok=False)
     for name in ['source', 'candidates', 'masks', 'review', 'previews', 'assets', 'review_image2', 'manual', 'rejected', 'repaired']:
         (job / name).mkdir()
-    manifest = {'schema_version': 1, 'method': 'flat-background-connected-matte', 'sources': [], 'assets': []}
+    manifest = {'schema_version': 2, 'method': 'codex-discovery-routing-builtin-repair',
+                'discovery': plan.get('discovery', {'provider': 'codex-vision', 'coverage': 'not independently measured'}),
+                'sources': [], 'assets': []}
     for sid, (path, size) in sources.items():
         read_image(path).save(job / 'source' / f'{sid}.png')
         manifest['sources'].append({'id': sid, 'original_path': str(path), 'sha256': digest(path), 'size': list(size)})
     for candidate in plan['candidates']:
         a = dict(candidate, status='ERROR', generated_repair=False)
+        a['initial_route'] = a['route']
         manifest['assets'].append(a)
         try:
             crop = read_image(job / 'source' / f"{a['source_id']}.png").crop(a['bbox'])
@@ -212,11 +219,14 @@ def build(args):
                 crop.save(job / folder / f"{a['id']}.png")
                 text = f"# {a['label']} ({a['id']})\n\n来源：../source/{a['source_id']}.png\n\n原因：{a['reason']}\n"
                 if a['route'] == 'IMAGE2':
-                    text += '\n' + a['repair_prompt'] + '\n\n保持可见主体的风格、颜色和结构，不增加无关元素；四周留边。补全部分属于生成内容。\n\n回图使用此素材 ID；交回后重新去背景及验收。\n'
+                    text += '\n' + repair_prompt(a) + '\n\n默认由 Codex 调用内置图片工具，回图通过 repair-result 导入并验收。\n'
                 (job / folder / f"{a['id']}.md").write_text(text, encoding='utf-8')
                 a['status'] = 'WAITING_REPAIR' if a['route'] == 'IMAGE2' else 'MANUAL'
         except Exception as exc:
             a.update(status='ERROR', error=str(exc))
+            if isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True) and (job / 'candidates' / f"{a['id']}.png").exists():
+                a.update(route='IMAGE2', status='WAITING_REPAIR', repair_mode='extract',
+                         routing_history=[{'from': 'AUTO', 'to': 'IMAGE2', 'reason': str(exc)}])
         save_manifest(job, manifest)
     contact_sheet(job, manifest)
     print(json.dumps({'job': str(job), 'counts': manifest['counts']}, ensure_ascii=False))
@@ -235,7 +245,8 @@ def review(args):
         if a['status'] != 'REVIEW' or digest(path) != a['review_sha256']:
             raise ValueError('Review stale or asset not awaiting review')
         inspect(read_image(path))
-        dest = job / ('assets' if args.decision == 'accept' else 'rejected') / path.name
+        rejected_name = f"{aid}-attempt-{len(a.get('repair_attempts', []))}.png"
+        dest = job / 'assets' / path.name if args.decision == 'accept' else job / 'rejected' / rejected_name
         if dest.exists():
             raise ValueError('Destination already exists')
         selected.append((a, path, dest))
@@ -244,6 +255,12 @@ def review(args):
         a.update(status='PASS' if args.decision == 'accept' else 'REJECTED',
                  visual_review={'decision': args.decision, 'note': args.note},
                  output_path=str(dest.relative_to(job)), output_sha256=digest(dest))
+        if args.decision == 'reject' and a.get('repair_allowed', True) and (a.get('repair_attempts') or a['route'] == 'AUTO'):
+            a.update(route='IMAGE2', status='WAITING_REPAIR' if len(a.get('repair_attempts', [])) < 2 else 'MANUAL',
+                     repair_feedback=args.note)
+        if a.get('repair_attempts'):
+            a['repair_attempts'][-1].update(status='PASS' if args.decision == 'accept' else 'REJECTED',
+                                           review_note=args.note)
         save_manifest(job, manifest)
     print(json.dumps(manifest['counts']))
     return 0
@@ -268,6 +285,113 @@ def repaired(args):
     save_manifest(job, manifest)
     contact_sheet(job, manifest)
     print(json.dumps(manifest['counts']))
+    return 0
+
+
+def inventory(args):
+    files = set()
+    for raw in args.input:
+        path = Path(raw).resolve()
+        if path.is_dir():
+            files.update(p.resolve() for p in path.iterdir() if p.suffix.lower() in ('.png', '.jpg', '.jpeg', '.webp', '.tif', '.tiff'))
+        elif path.is_file():
+            files.add(path)
+        else:
+            raise ValueError('Input does not exist')
+    if not files:
+        raise ValueError('No input images')
+    sources = [{'id': f'source_{i:03d}', 'path': str(p), 'size': list(read_image(p).size), 'sha256': digest(p)}
+               for i, p in enumerate(sorted(files), 1)]
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open('x', encoding='utf-8') as f:
+        json.dump({'sources': sources, 'discovery': {'provider': 'codex-vision', 'status': 'awaiting_image_analysis'},
+                   'candidates': []}, f, ensure_ascii=False, indent=2)
+    print(json.dumps({'inventory': str(output), 'sources': sources}, ensure_ascii=False))
+    return 0
+
+
+def repair_prompt(asset):
+    request = asset.get('repair_prompt') or f"从参考图中仅提取 {asset['label']}，移除背景和相邻元素。"
+    constraint = ('允许补全被遮挡或缺失的部分，保持可见结构、颜色、风格和透视。'
+                  if asset.get('repair_mode') == 'complete' else
+                  '目标本身完整：只去背景、分离主体，保持可见轮廓、纹理、配色、朝向，不补画或重新设计主体。')
+    return (request + '\n' + constraint +
+            '\n输出单个可复用组合，四周留出至少 5% 空白边距，使用真正的透明 Alpha 背景。'
+            '不要画棋盘格、底板、文字或水印。保留主体内部高光，空隙应透明。' +
+            ('\n上次未通过原因：' + asset['repair_feedback'] if asset.get('repair_feedback') else ''))
+
+
+def repair_queue(args):
+    job, manifest = load_job(args.job)
+    tasks = []
+    for a in manifest['assets']:
+        if a['status'] == 'WAITING_REPAIR':
+            tasks.append({'id': a['id'], 'label': a['label'], 'provider': 'builtin-image-tool',
+                          'model': None, 'attempts_used': len(a.get('repair_attempts', [])),
+                          'referenced_image_paths': [str(job / 'candidates' / f"{a['id']}.png")],
+                          'prompt': repair_prompt(a)})
+    print(json.dumps({'tasks': tasks, 'unresolved': [a['id'] for a in manifest['assets']
+                if a['status'] in ('REPAIRING', 'REPAIR_BLOCKED')]}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def repair_start(args):
+    job, manifest = load_job(args.job)
+    a = next(a for a in manifest['assets'] if a['id'] == args.id)
+    attempts = a.setdefault('repair_attempts', [])
+    if a['status'] != 'WAITING_REPAIR' or len(attempts) >= 2 or not a.get('repair_allowed', True):
+        raise ValueError('Not queued, unresolved request, or two-attempt limit reached')
+    attempts.append({'number': len(attempts) + 1, 'provider': 'builtin-image-tool', 'model': None,
+                     'prompt': repair_prompt(a), 'status': 'IN_FLIGHT',
+                     'started_at': datetime.now(timezone.utc).isoformat()})
+    a['status'] = 'REPAIRING'
+    save_manifest(job, manifest)
+    print(json.dumps({'id': a['id'], 'attempt': attempts[-1]['number'], 'prompt': attempts[-1]['prompt']}, ensure_ascii=False))
+    return 0
+
+
+def repair_result(args):
+    job, manifest = load_job(args.job)
+    a = next(a for a in manifest['assets'] if a['id'] == args.id)
+    if a['status'] not in ('REPAIRING', 'REPAIR_BLOCKED') or not a.get('repair_attempts'):
+        raise ValueError('Start/resume a recorded repair before importing its result')
+    attempt = a['repair_attempts'][-1]
+    if args.failure:
+        # An uncertain provider outcome must not cause a duplicate external request.
+        attempt.update(status='BLOCKED', error=args.failure)
+        a['status'] = 'REPAIR_BLOCKED'
+        save_manifest(job, manifest)
+        print(json.dumps({'status': a['status']}))
+        return 2
+    original = Path(args.input).resolve()
+    output = read_image(original)
+    dest = job / 'repaired' / f"{a['id']}-attempt-{attempt['number']}.png"
+    if dest.exists():
+        raise ValueError('Attempt artifact already exists; preserve history')
+    output.save(dest)
+    attempt.update(status='RECEIVED', original_path=str(original), sha256=digest(original),
+                   artifact_path=str(dest.relative_to(job)), artifact_sha256=digest(dest),
+                   model=args.model, tool_reference=args.tool_reference)
+    a.update(generated_repair=True, provider='builtin-image-tool')
+    try:
+        # Preserve native alpha; never re-matte a transparent generated result.
+        metrics = inspect(output)
+    except ValueError as exc:
+        attempt.update(status='QC_FAILED', error=str(exc))
+        a.update(status='WAITING_REPAIR' if len(a['repair_attempts']) < 2 else 'MANUAL', repair_feedback=str(exc))
+        save_manifest(job, manifest)
+        print(json.dumps({'status': a['status'], 'error': str(exc)}))
+        return 1
+    aid = a['id']
+    output.getchannel('A').save(job / 'masks' / f'{aid}.png')
+    output.save(job / 'review' / f'{aid}.png')
+    preview(read_image(job / 'candidates' / f'{aid}.png'), output, job / 'previews' / f'{aid}.jpg')
+    a.update(status='REVIEW', metrics=metrics, review_sha256=digest(job / 'review' / f'{aid}.png'))
+    attempt['status'] = 'REVIEW'
+    save_manifest(job, manifest)
+    contact_sheet(job, manifest)
+    print(json.dumps({'status': 'REVIEW', 'id': aid, 'metrics': metrics}))
     return 0
 
 
@@ -336,6 +460,26 @@ def main():
     p.add_argument('--plan', required=True)
     p.add_argument('--job', required=True)
     p.set_defaults(run=build)
+    p = sub.add_parser('inventory')
+    p.add_argument('--input', nargs='+', required=True)
+    p.add_argument('--output', required=True)
+    p.set_defaults(run=inventory)
+    p = sub.add_parser('repair-queue')
+    p.add_argument('--job', required=True)
+    p.set_defaults(run=repair_queue)
+    p = sub.add_parser('repair-start')
+    p.add_argument('--job', required=True)
+    p.add_argument('--id', required=True)
+    p.set_defaults(run=repair_start)
+    p = sub.add_parser('repair-result')
+    p.add_argument('--job', required=True)
+    p.add_argument('--id', required=True)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--input')
+    group.add_argument('--failure')
+    p.add_argument('--model', default=None, help='Only when explicitly reported by the image tool')
+    p.add_argument('--tool-reference', default=None)
+    p.set_defaults(run=repair_result)
     p = sub.add_parser('review')
     p.add_argument('--job', required=True)
     p.add_argument('--id', nargs='+', required=True)
