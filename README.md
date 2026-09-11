@@ -36,6 +36,14 @@
 - `docs/`：实施与验证报告
 - `promo/`：基于真实运行结果制作的宣传图和实测素材
 
+`promo/v2/` 是按 INPUT → PROCESS → OUTPUT 重新整理的 3:4 宣传视觉：
+
+- `01-product-workflow-v2.png`：产品工作流主视觉
+- `02-14-assets-case-v2.png`：14 个几何素材真实输出
+- `03-shell-completion-case-v2.png`：贝壳遮挡补全与深浅底复核
+
+V2 海报中的实测素材使用真实 Skill 输出嵌入，贝壳不可见区域明确标注为生成式补全。
+
 ## 实测结果
 
 当前公开示例包含：
