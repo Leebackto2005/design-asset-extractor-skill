@@ -73,21 +73,23 @@ def color(value):
     return np.array(value, dtype=np.float32)
 
 
-def matte(im, background, points=(), foreground_points=()):
+def matte(im, background, points=(), foreground_points=(), tolerance=36):
     # ponytail: uniform backgrounds only; semantic segmentation is a future need.
+    if type(tolerance) is not int or not 16 <= tolerance <= 120:
+        raise ValueError('background_tolerance must be an integer in 16..120')
     im = im.convert('RGBA')
     rgb = np.asarray(im.convert('RGB'), dtype=np.float32)
     bg = color(background)
     distance = np.linalg.norm(rgb - bg, axis=2)
-    _, labels = cv2.connectedComponents((distance < 36).astype(np.uint8), connectivity=8)
+    _, labels = cv2.connectedComponents((distance < tolerance).astype(np.uint8), connectivity=8)
     exterior = np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]])
     selected = set(exterior.tolist()) - {0}
     for x, y in points:
-        if not (0 <= x < im.width and 0 <= y < im.height) or distance[y, x] > 16:
+        if not (0 <= x < im.width and 0 <= y < im.height) or distance[y, x] > tolerance * 0.45:
             raise ValueError('Background point outside crop or not close to background color')
         selected.add(int(labels[y, x]))
     connected = np.isin(labels, list(selected))
-    alpha = np.where(connected, np.clip((distance - 8) / 28, 0, 1), 1)
+    alpha = np.where(connected, np.clip((distance - tolerance * 0.22) / (tolerance * 0.78), 0, 1), 1)
     clean = np.clip((rgb - (1 - alpha[..., None]) * bg) / np.maximum(alpha[..., None], 1 / 255), 0, 255)
     alpha *= np.asarray(im.getchannel('A'), dtype=np.float32) / 255
     rgba = np.dstack([np.rint(clean).astype(np.uint8), np.rint(alpha * 255).astype(np.uint8)])
@@ -196,7 +198,14 @@ def preview(source, output, target):
 
 def process(job, asset, im, background=None, points=(), foreground_points=()):
     method = asset.get('extraction_method', 'matte')
-    output = (matte(im, background, points, foreground_points) if method == 'matte'
+    if method == 'matte' and asset.get('padding', 12):
+        padding = asset.get('padding', 12)
+        if type(padding) is not int or not 1 <= padding <= 512:
+            raise ValueError('padding must be an integer in 1..512')
+        im = ImageOps.expand(im, border=padding, fill=tuple(background))
+        points = [(x + padding, y + padding) for x, y in points]
+        foreground_points = [(x + padding, y + padding) for x, y in foreground_points]
+    output = (matte(im, background, points, foreground_points, asset.get('background_tolerance', 36)) if method == 'matte'
               else local_extract(im, method, asset.get('padding', 12)))
     metrics = inspect(output)
     aid = asset['id']
@@ -250,6 +259,9 @@ def validate_plan(plan, base):
                 raise ValueError('Unknown extraction_method')
             if method == 'matte':
                 color(a['background_rgb'])
+                tolerance = a.get('background_tolerance', 36)
+                if type(tolerance) is not int or not 16 <= tolerance <= 120:
+                    raise ValueError('background_tolerance must be an integer in 16..120')
             for p in a.get('background_points', []) + a.get('foreground_points', []):
                 if len(p) != 2 or any(type(v) is not int for v in p) or not (x0 <= p[0] < x1 and y0 <= p[1] < y1):
                     raise ValueError('Invalid background point')
