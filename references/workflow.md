@@ -1,6 +1,13 @@
 # 执行接口
 
-脚本 `scripts/asset_job.py` 需要 Pillow、NumPy、OpenCV，使用本机已安装环境。所有路径按实际 Skill 所在位置展开。无需 OpenAI SDK 或 API Key。
+脚本使用 Python 3.12，Pillow、NumPy、OpenCV 的验证版本固定在 `requirements.txt`。无需 OpenAI SDK 或 API Key。首次由 Codex 在仓库根目录执行：
+
+```powershell
+./scripts/bootstrap.ps1
+# 可显式提供 Python 3.12 路径：./scripts/bootstrap.ps1 -Python C:/Python312/python.exe
+```
+
+脚本自动创建 `.venv`、安装固定版本、检查依赖并运行两套离线测试；失败立即停止。后续以下命令中的 `python` 均替换为仓库下 `.venv/Scripts/python.exe`。非 Windows 环境用 Python 3.12 执行 `python -m venv .venv`、`.venv/bin/python -m pip install -r requirements.txt` 及两套测试。固定的是库版本；任务还记录实际 Python/平台/脚本哈希，不承诺跨平台逐字节重算一致。
 
 ## 自动发现与计划
 
@@ -30,6 +37,8 @@ python asset_job.py inventory --input 图片.png 或文件夹 --output 新目录
 ID 仅 ASCII 字母、数字、下划线、连字符且唯一。bbox=[left,top,right,bottom]，右下不包含，基于 EXIF 校正后源图。route 接受 A/B/C 或旧 AUTO/IMAGE2/MANUAL，存储兼容旧名称。B 必填具体 repair_prompt；repair_mode 为 extract 或 complete。repair_allowed=false 禁止失败后生成式回退。
 
 A 必填采样 background_rgb，可选 background_points 标记真实内孔，可选 foreground_points 选择目标连通组件。脚本保留不与背景连通的内部浅色内容。颜色阈值仅为平底启发式，不代表质量评分。
+
+A 的默认 extraction_method=matte 使用上述颜色参数。另支持 `crop`（精确矩形裁切，padding 默认 12 像素）和 `bright-background`（浅色背景上的深色不透明主体，用 GrabCut 分割并向内软化边缘）；后两者不需要 background_rgb。crop 保留照片内部背景，仅外围透明。bright-background 不是通用语义分割，对浅色主体/高光/玻璃不适用，必须检查深浅底。若源是模型生成回图，候选必须标记 generated_source=true，并在 reason 中关联原任务/尝试。两种本地输出都先 REVIEW，不能自动 PASS。
 
 ```text
 python asset_job.py build --plan plan.json --job 新任务目录
@@ -65,6 +74,27 @@ python asset_job.py repair-result --job 任务目录 --id source_001_turtle --fa
 manifest 的 repair_attempts 保存每次 prompt、provider、model、工具引用、来源和 SHA-256。model=null 表示工具没有明确披露，不代表特定 Images 型号。generated_repair=true 表示图像模型处理，哪怕是 extract 也不能说像素未变。
 
 状态：REVIEW、PASS、WAITING_REPAIR、REPAIRING、REPAIR_BLOCKED、MANUAL、REJECTED、ERROR。只有 PASS 进入 assets。旧诊断任务不会被自动迁移或改写。
+
+## 自动推进与交付
+
+```text
+python scripts/asset_job.py status --job 任务目录
+python scripts/asset_job.py finalize --job 任务目录
+python scripts/asset_job.py verify --job 任务目录
+```
+
+status 返回每个未解决候选的下一步动作及原图/预览路径。Codex 循环执行动作直到 PASS/MANUAL 或明确外部阻塞。finalize 拒绝任何未解决候选，校验 PASS 文件，输出 `delivery.json`（本地通过、生成通过、人工数量及文件路径）和 `checksums.json`。整个目录包含计划、源图快照、候选、每次回图、审核及人工任务，可整体复制后 verify。verify 检查清单文件是否缺失或改变；这不是防恶意修改的签名，也不重新证明视觉质量。任务被修改后需重新 finalize。
+
+导入在保存回图后中断，可对同一次请求再次 repair-result；已有回图必须与传入图片像素一致，不覆盖另一张图。B + repair_allowed=false、A 严格模式质量失败、修补两次失败均转人工并生成图和原因。人工处理的完成不由脚本假定。
+
+可复现离线样例（合成图，未调用图片模型）：
+
+```text
+python scripts/test_workflow.py --output outputs/offline-demo
+python scripts/asset_job.py verify --job outputs/offline-demo/synthetic-workflow
+```
+
+样例验证导入、恢复、人工收尾和交付校验；审核注释明确标记 synthetic，不能当作真实图片模型验收。输出目录必须尚未使用。
 
 ```text
 python asset_job.py self-test

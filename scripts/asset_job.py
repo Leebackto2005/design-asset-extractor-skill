@@ -5,11 +5,33 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import shutil
+import platform
 from datetime import datetime, timezone
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
+import PIL
+
+
+def environment():
+    return {'python': platform.python_version(), 'platform': platform.platform(),
+            'pillow': PIL.__version__, 'numpy': np.__version__, 'opencv': cv2.__version__,
+            'script_sha256': digest(__file__)}
+
+
+def manual(job, asset, reason):
+    """All routes use the same handoff; retain previous attempts and reviews."""
+    aid = asset['id']
+    shutil.copyfile(job / 'candidates' / f'{aid}.png', job / 'manual' / f'{aid}.png')
+    asset.update(status='MANUAL', manual_reason=reason)
+    (job / 'manual' / f'{aid}.json').write_text(
+        json.dumps(asset, ensure_ascii=False, indent=2), encoding='utf-8')
+    (job / 'manual' / f'{aid}.md').write_text(
+        f"# {asset['label']} ({aid})\n\n{reason}\n\n"
+        f"Source: ../source/{asset['source_id']}.png\n\n"
+        f"Crop: {aid}.png\n\nAttempts and review: {aid}.json\n", encoding='utf-8')
 
 
 def digest(path):
@@ -114,6 +136,51 @@ def inspect(im):
             'soft_pixels': int(((alpha > 0) & (alpha < 255)).sum())}
 
 
+def local_extract(im, method, padding=12):
+    if type(padding) is not int or not 1 <= padding <= 512:
+        raise ValueError('padding must be an integer in 1..512')
+    if method == 'crop':
+        output = Image.new('RGBA', (im.width + 2 * padding, im.height + 2 * padding))
+        output.paste(im, (padding, padding))
+        return output
+    if method != 'bright-background':
+        raise ValueError('Unsupported local extraction method')
+    # Bounded fallback for dark opaque subjects on light neutral backdrops.
+    # Not a general semantic segmenter: white/transparent subjects require manual work.
+    rgb = np.asarray(im.convert('RGB'))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    border = np.concatenate([gray[0], gray[-1], gray[:, 0], gray[:, -1]])
+    if np.percentile(border, 5) < 175:
+        raise ValueError('Bright-background method requires a clear light border')
+    mask = np.where(gray < 160, cv2.GC_PR_FGD, cv2.GC_PR_BGD).astype(np.uint8)
+    mask[gray > 195] = cv2.GC_BGD
+    mask[gray < 70] = cv2.GC_FGD
+    mask[[0, -1], :] = cv2.GC_BGD
+    mask[:, [0, -1]] = cv2.GC_BGD
+    if not (mask == cv2.GC_FGD).any():
+        raise ValueError('No reliable dark foreground seed')
+    cv2.setRNGSeed(0)
+    cv2.grabCut(rgb, mask, None, np.zeros((1, 65)), np.zeros((1, 65)), 5, cv2.GC_INIT_WITH_MASK)
+    foreground = ((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD)).astype(np.uint8)
+    # Feather inward only: do not reintroduce bright backdrop into edge RGB.
+    inside = cv2.distanceTransform(foreground, cv2.DIST_L2, 5)
+    alpha = np.rint(np.clip(inside / 2, 0, 1) * 255).astype(np.uint8)
+    alpha = np.minimum(alpha, np.asarray(im.getchannel('A')))
+    rgba = np.dstack([rgb, alpha])
+    core = inside >= 8
+    if core.any():
+        _, nearest = cv2.distanceTransformWithLabels((~core).astype(np.uint8), cv2.DIST_L2, 5,
+                                                     labelType=cv2.DIST_LABEL_PIXEL)
+        colors = np.zeros((int(nearest.max()) + 1, 3), dtype=np.uint8)
+        colors[nearest[core]] = rgb[core]
+        edge = (alpha > 0) & ~core
+        rgba[edge, :3] = colors[nearest[edge]]
+    rgba[alpha == 0, :3] = 0
+    result = Image.fromarray(rgba)
+    inspect(result)  # Check before padding so a clipped subject cannot pass.
+    return result
+
+
 def preview(source, output, target):
     canvas = Image.new('RGB', (900, 350), '#dddddd')
     draw = ImageDraw.Draw(canvas)
@@ -127,8 +194,10 @@ def preview(source, output, target):
     canvas.save(target)
 
 
-def process(job, asset, im, background, points, foreground_points=()):
-    output = matte(im, background, points, foreground_points)
+def process(job, asset, im, background=None, points=(), foreground_points=()):
+    method = asset.get('extraction_method', 'matte')
+    output = (matte(im, background, points, foreground_points) if method == 'matte'
+              else local_extract(im, method, asset.get('padding', 12)))
     metrics = inspect(output)
     aid = asset['id']
     output.getchannel('A').save(job / 'masks' / f'{aid}.png')
@@ -176,7 +245,11 @@ def validate_plan(plan, base):
         if not (0 <= x0 < x1 <= size[0] and 0 <= y0 < y1 <= size[1]):
             raise ValueError('bbox outside image')
         if a['route'] == 'AUTO':
-            color(a['background_rgb'])
+            method = a.get('extraction_method', 'matte')
+            if method not in ('matte', 'crop', 'bright-background'):
+                raise ValueError('Unknown extraction_method')
+            if method == 'matte':
+                color(a['background_rgb'])
             for p in a.get('background_points', []) + a.get('foreground_points', []):
                 if len(p) != 2 or any(type(v) is not int for v in p) or not (x0 <= p[0] < x1 and y0 <= p[1] < y1):
                     raise ValueError('Invalid background point')
@@ -184,6 +257,8 @@ def validate_plan(plan, base):
             raise ValueError('IMAGE2 needs a specific repair_prompt')
         if a.get('repair_mode', 'extract') not in ('extract', 'complete'):
             raise ValueError('repair_mode must be extract or complete')
+        if 'repair_allowed' in a and type(a['repair_allowed']) is not bool:
+            raise ValueError('repair_allowed must be a boolean')
     if not sources or not ids:
         raise ValueError('Plan must contain sources and candidates')
     return sources
@@ -198,13 +273,16 @@ def build(args):
     for name in ['source', 'candidates', 'masks', 'review', 'previews', 'assets', 'review_image2', 'manual', 'rejected', 'repaired']:
         (job / name).mkdir()
     manifest = {'schema_version': 2, 'method': 'codex-discovery-routing-builtin-repair',
+                'environment': environment(), 'plan_sha256': digest(plan_path),
                 'discovery': plan.get('discovery', {'provider': 'codex-vision', 'coverage': 'not independently measured'}),
                 'sources': [], 'assets': []}
+    shutil.copyfile(plan_path, job / 'plan.json')
     for sid, (path, size) in sources.items():
         read_image(path).save(job / 'source' / f'{sid}.png')
         manifest['sources'].append({'id': sid, 'original_path': str(path), 'sha256': digest(path), 'size': list(size)})
+        manifest['sources'][-1]['snapshot_sha256'] = digest(job / 'source' / f'{sid}.png')
     for candidate in plan['candidates']:
-        a = dict(candidate, status='ERROR', generated_repair=False)
+        a = dict(candidate, status='ERROR', generated_repair=bool(candidate.get('generated_source', False)))
         a['initial_route'] = a['route']
         manifest['assets'].append(a)
         try:
@@ -213,7 +291,9 @@ def build(args):
             if a['route'] == 'AUTO':
                 points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('background_points', [])]
                 fg_points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('foreground_points', [])]
-                process(job, a, crop, a['background_rgb'], points, fg_points)
+                process(job, a, crop, a.get('background_rgb'), points, fg_points)
+            elif a['route'] == 'MANUAL' or not a.get('repair_allowed', True):
+                manual(job, a, a['reason'] if a['route'] == 'MANUAL' else 'Generative repair disabled')
             else:
                 folder = 'review_image2' if a['route'] == 'IMAGE2' else 'manual'
                 crop.save(job / folder / f"{a['id']}.png")
@@ -227,6 +307,11 @@ def build(args):
             if isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True) and (job / 'candidates' / f"{a['id']}.png").exists():
                 a.update(route='IMAGE2', status='WAITING_REPAIR', repair_mode='extract',
                          routing_history=[{'from': 'AUTO', 'to': 'IMAGE2', 'reason': str(exc)}])
+            elif isinstance(exc, ValueError) and a['route'] == 'AUTO' and (job / 'candidates' / f"{a['id']}.png").exists():
+                manual(job, a, 'Local extraction failed; generative repair disabled: ' + str(exc))
+        candidate_path = job / 'candidates' / f"{a['id']}.png"
+        if candidate_path.exists():
+            a['candidate_sha256'] = digest(candidate_path)
         save_manifest(job, manifest)
     contact_sheet(job, manifest)
     print(json.dumps({'job': str(job), 'counts': manifest['counts']}, ensure_ascii=False))
@@ -261,6 +346,8 @@ def review(args):
         if a.get('repair_attempts'):
             a['repair_attempts'][-1].update(status='PASS' if args.decision == 'accept' else 'REJECTED',
                                            review_note=args.note)
+        if args.decision == 'reject' and a['status'] in ('MANUAL', 'REJECTED'):
+            manual(job, a, args.note)
         save_manifest(job, manifest)
     print(json.dumps(manifest['counts']))
     return 0
@@ -272,6 +359,8 @@ def repaired(args):
     a = next(a for a in manifest['assets'] if a['id'] == args.id)
     if a['status'] != 'WAITING_REPAIR':
         raise ValueError('Only WAITING_REPAIR accepts a first repair')
+    if not a.get('repair_allowed', True):
+        raise ValueError('Generative repair disabled')
     original = Path(args.input).resolve()
     im = read_image(original)
     inspect(matte(im, args.background, args.point))
@@ -342,7 +431,11 @@ def repair_start(args):
     attempts = a.setdefault('repair_attempts', [])
     if a['status'] != 'WAITING_REPAIR' or len(attempts) >= 2 or not a.get('repair_allowed', True):
         raise ValueError('Not queued, unresolved request, or two-attempt limit reached')
+    candidate = job / 'candidates' / f"{a['id']}.png"
+    if a.get('candidate_sha256') and digest(candidate) != a['candidate_sha256']:
+        raise ValueError('Candidate changed after build')
     attempts.append({'number': len(attempts) + 1, 'provider': 'builtin-image-tool', 'model': None,
+                     'reference_sha256': digest(candidate),
                      'prompt': repair_prompt(a), 'status': 'IN_FLIGHT',
                      'started_at': datetime.now(timezone.utc).isoformat()})
     a['status'] = 'REPAIRING'
@@ -367,19 +460,26 @@ def repair_result(args):
     original = Path(args.input).resolve()
     output = read_image(original)
     dest = job / 'repaired' / f"{a['id']}-attempt-{attempt['number']}.png"
+    # Resume a partially imported result only when pixels are identical.
     if dest.exists():
-        raise ValueError('Attempt artifact already exists; preserve history')
-    output.save(dest)
+        stored = read_image(dest)
+        if stored.size != output.size or not np.array_equal(np.asarray(stored), np.asarray(output)):
+            raise ValueError('Attempt artifact differs; preserve history')
+    else:
+        output.save(dest)
     attempt.update(status='RECEIVED', original_path=str(original), sha256=digest(original),
                    artifact_path=str(dest.relative_to(job)), artifact_sha256=digest(dest),
                    model=args.model, tool_reference=args.tool_reference)
     a.update(generated_repair=True, provider='builtin-image-tool')
+    save_manifest(job, manifest)
     try:
         # Preserve native alpha; never re-matte a transparent generated result.
         metrics = inspect(output)
     except ValueError as exc:
         attempt.update(status='QC_FAILED', error=str(exc))
         a.update(status='WAITING_REPAIR' if len(a['repair_attempts']) < 2 else 'MANUAL', repair_feedback=str(exc))
+        if a['status'] == 'MANUAL':
+            manual(job, a, str(exc))
         save_manifest(job, manifest)
         print(json.dumps({'status': a['status'], 'error': str(exc)}))
         return 1
@@ -392,6 +492,82 @@ def repair_result(args):
     save_manifest(job, manifest)
     contact_sheet(job, manifest)
     print(json.dumps({'status': 'REVIEW', 'id': aid, 'metrics': metrics}))
+    return 0
+
+
+def status(args):
+    job, manifest = load_job(args.job)
+    actions = []
+    for a in manifest['assets']:
+        state = a['status']
+        if state == 'REVIEW':
+            action = 'view preview, then review accept/reject with observations'
+        elif state == 'WAITING_REPAIR':
+            action = 'view candidate, repair-start, call image_gen once, repair-result'
+        elif state in ('REPAIRING', 'REPAIR_BLOCKED'):
+            action = 'recover original tool result; do not dispatch again'
+        elif state in ('ERROR', 'REJECTED'):
+            action = 'resolve local error; preserve job and report if blocked'
+        else:
+            continue
+        actions.append({'id': a['id'], 'status': state, 'next': action,
+                        'candidate': str(job / 'candidates' / f"{a['id']}.png"),
+                        'preview': str(job / 'previews' / f"{a['id']}.jpg"),
+                        'error': a.get('error')})
+    print(json.dumps({'job': str(job), 'counts': manifest['counts'],
+                      'ready_to_finalize': not actions, 'actions': actions}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def finalize(args):
+    """Only resolved jobs are deliveries. A checksum index allows offline replay."""
+    job, manifest = load_job(args.job)
+    pending = [a['id'] for a in manifest['assets'] if a['status'] not in ('PASS', 'MANUAL')]
+    if pending:
+        raise ValueError('Unresolved candidates: ' + ', '.join(pending))
+    if manifest.get('plan_sha256') and digest(job / 'plan.json') != manifest['plan_sha256']:
+        raise ValueError('Saved plan changed')
+    for source in manifest['sources']:
+        if source.get('snapshot_sha256') and digest(job / 'source' / f"{source['id']}.png") != source['snapshot_sha256']:
+            raise ValueError('Source snapshot changed: ' + source['id'])
+    for a in manifest['assets']:
+        if a.get('candidate_sha256') and digest(job / 'candidates' / f"{a['id']}.png") != a['candidate_sha256']:
+            raise ValueError('Candidate changed: ' + a['id'])
+        for attempt in a.get('repair_attempts', []):
+            if attempt.get('artifact_path') and digest(job / attempt['artifact_path']) != attempt['artifact_sha256']:
+                raise ValueError('Repair artifact changed: ' + a['id'])
+        if a['status'] == 'PASS':
+            path = job / 'assets' / f"{a['id']}.png"
+            if digest(path) != a['output_sha256']:
+                raise ValueError('Delivered asset changed: ' + a['id'])
+            inspect(read_image(path))
+        elif not (job / 'manual' / f"{a['id']}.json").exists():
+            raise ValueError('Missing manual handoff: ' + a['id'])
+    report = {'environment': manifest.get('environment'), 'discovery': manifest.get('discovery'), 'counts': manifest['counts'],
+              'local_pass': sum(a['status'] == 'PASS' and not a['generated_repair'] for a in manifest['assets']),
+              'generated_pass': sum(a['status'] == 'PASS' and a['generated_repair'] for a in manifest['assets']),
+              'assets': [{'id': a['id'], 'label': a['label'], 'status': a['status'],
+                          'generated': a['generated_repair'],
+                          'path': 'assets/' + a['id'] + '.png' if a['status'] == 'PASS' else 'manual/' + a['id'] + '.json',
+                          'reason': a.get('manual_reason')} for a in manifest['assets']]}
+    (job / 'delivery.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+    index = {str(p.relative_to(job).as_posix()): digest(p) for p in sorted(job.rglob('*'))
+             if p.is_file() and p.name != 'checksums.json'}
+    (job / 'checksums.json').write_text(json.dumps(index, indent=2), encoding='utf-8')
+    print(json.dumps({'delivery': str(job / 'delivery.json'), 'files': len(index), 'counts': manifest['counts']}))
+    return 0
+
+
+def verify(args):
+    job = Path(args.job).resolve()
+    index = json.loads((job / 'checksums.json').read_text(encoding='utf-8'))
+    if not index or 'delivery.json' not in index or 'manifest.json' not in index:
+        raise ValueError('Incomplete delivery index')
+    for relative, expected in index.items():
+        path = (job / relative).resolve()
+        if not path.is_relative_to(job) or not path.is_file() or digest(path) != expected:
+            raise ValueError('Missing or changed artifact: ' + relative)
+    print(json.dumps({'verified_files': len(index), 'job': str(job)}))
     return 0
 
 
@@ -434,7 +610,7 @@ def self_test():
         repaired(argparse.Namespace(job=job, id='repair', input=root / 'source.png', background=[248, 245, 238], point=[[50, 50]]))
         review(argparse.Namespace(job=job, id=['repair'], decision='reject', note='Exercise rejection'))
         _, m = load_job(job)
-        assert m['counts']['PASS'] == 1 and m['counts']['MANUAL'] == 1 and m['counts']['REJECTED'] == 1
+        assert m['counts']['PASS'] == 1 and m['counts']['MANUAL'] == 2
         assert m['assets'][1]['generated_repair'] is True
         try:
             build(argparse.Namespace(plan=pp, job=job))
@@ -456,6 +632,10 @@ def self_test():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
+    for command, function in [('status', status), ('finalize', finalize), ('verify', verify)]:
+        p = sub.add_parser(command)
+        p.add_argument('--job', required=True)
+        p.set_defaults(run=function)
     p = sub.add_parser('build')
     p.add_argument('--plan', required=True)
     p.add_argument('--job', required=True)

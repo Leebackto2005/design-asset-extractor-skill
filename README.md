@@ -55,11 +55,22 @@ V2 海报中的实测素材使用真实 Skill 输出嵌入，贝壳不可见区�
 
 ## 运行验证
 
+首次在仓库根目录运行（Python 3.12；自动创建隔离环境、安装固定依赖并测试）：
+
 ```powershell
-$env:PYTHONUTF8 = '1'
-python scripts/asset_job.py self-test
-python scripts/test_workflow.py
+./scripts/bootstrap.ps1
 ```
+
+后续使用 `.venv/Scripts/python.exe`。Codex 按 SKILL.md 自动看图、建计划、分流、调用图片工具、复核，直到完成或遇到明确阻塞。`status` 给出下一步，`finalize` 生成交付清单及哈希索引，`verify` 在复制任务目录后检查已保存产物。只有 PASS 计为可交付素材，人工项附任务图和原因。
+
+生成一套可检查的离线合成样例：
+
+```powershell
+./.venv/Scripts/python.exe scripts/test_workflow.py --output outputs/offline-demo
+./.venv/Scripts/python.exe scripts/asset_job.py verify --job outputs/offline-demo/synthetic-workflow
+```
+
+样例只验证处理流程，未调用图片模型。复现范围是固定库版本、计划与来源记录、保存的回图和最终素材；重新调用生成模型不保证像素一致。依赖及命令详见 [执行接口](references/workflow.md)。
 
 本项目不包含用户原始图片、API Key、Codex 缓存或临时任务目录。
 
