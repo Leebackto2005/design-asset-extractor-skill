@@ -36,6 +36,8 @@ python asset_job.py inventory --input 图片.png 或文件夹 --output 新目录
 
 ID 仅 ASCII 字母、数字、下划线、连字符且唯一。bbox=[left,top,right,bottom]，右下不包含，基于 EXIF 校正后源图。route 接受 A/B/C 或旧 AUTO/IMAGE2/MANUAL，存储兼容旧名称。B 必填具体 repair_prompt；repair_mode 为 extract 或 complete。repair_allowed=false 禁止失败后生成式回退。
 
+重叠图形计划只分「组合素材」与「拆解素材」：先按可复用区域建立组合候选（例如 `red_circle_lines_combo`），bbox 包住完整组合，reason 说明包含的图形与交叠关系；原图中完整、且能干净去掉相邻碎片的主体可另建拆解候选。若候选预览混入其他图形残片，修改 bbox/前景点后重建新任务，或按实际范围改为组合；不可把混入碎片的结果当作拆解素材。对被遮挡的不可见部分默认不建独立补全任务；只有用户明确要求时才另建 B/complete，并标明生成式来源。最终清单按组合素材与拆解素材分组报告。
+
 A 必填采样 background_rgb，可选 background_points 标记真实内孔，可选 foreground_points 选择目标连通组件。脚本保留不与背景连通的内部浅色内容。颜色阈值仅为平底启发式，不代表质量评分。
 
 A 的默认 extraction_method=matte 使用上述颜色参数。另支持 `crop`（精确矩形裁切，padding 默认 12 像素）和 `bright-background`（浅色背景上的深色不透明主体，用 GrabCut 分割并向内软化边缘）；后两者不需要 background_rgb。crop 保留照片内部背景，仅外围透明。bright-background 不是通用语义分割，对浅色主体/高光/玻璃不适用，必须检查深浅底。若源是模型生成回图，候选必须标记 generated_source=true，并在 reason 中关联原任务/尝试。两种本地输出都先 REVIEW，不能自动 PASS。
