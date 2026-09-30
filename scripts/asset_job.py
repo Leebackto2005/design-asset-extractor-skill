@@ -198,15 +198,17 @@ def preview(source, output, target):
 
 def process(job, asset, im, background=None, points=(), foreground_points=()):
     method = asset.get('extraction_method', 'matte')
-    if method == 'matte' and asset.get('padding', 12):
-        padding = asset.get('padding', 12)
-        if type(padding) is not int or not 1 <= padding <= 512:
-            raise ValueError('padding must be an integer in 1..512')
-        im = ImageOps.expand(im, border=padding, fill=tuple(background))
-        points = [(x + padding, y + padding) for x, y in points]
-        foreground_points = [(x + padding, y + padding) for x, y in foreground_points]
     output = (matte(im, background, points, foreground_points, asset.get('background_tolerance', 36)) if method == 'matte'
               else local_extract(im, method, asset.get('padding', 12)))
+    # Check the actual crop before adding transparent padding. Padding cannot
+    # prove that background removal succeeded or that the target is complete.
+    inspect(output)
+    if method == 'matte':
+        padding = asset.get('padding', 12)
+        if type(padding) is not int or not 0 <= padding <= 512:
+            raise ValueError('padding must be an integer in 0..512 for matte')
+        if padding:
+            output = ImageOps.expand(output, border=padding, fill=(0, 0, 0, 0))
     metrics = inspect(output)
     aid = asset['id']
     output.getchannel('A').save(job / 'masks' / f'{aid}.png')
@@ -257,6 +259,9 @@ def validate_plan(plan, base):
             method = a.get('extraction_method', 'matte')
             if method not in ('matte', 'crop', 'bright-background'):
                 raise ValueError('Unknown extraction_method')
+            padding = a.get('padding', 12)
+            if type(padding) is not int or not (0 if method == 'matte' else 1) <= padding <= 512:
+                raise ValueError('Invalid padding for extraction_method')
             if method == 'matte':
                 color(a['background_rgb'])
                 tolerance = a.get('background_tolerance', 36)
@@ -300,6 +305,7 @@ def build(args):
         try:
             crop = read_image(job / 'source' / f"{a['source_id']}.png").crop(a['bbox'])
             crop.save(job / 'candidates' / f"{a['id']}.png")
+            a['candidate_sha256'] = digest(job / 'candidates' / f"{a['id']}.png")
             if a['route'] == 'AUTO':
                 points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('background_points', [])]
                 fg_points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('foreground_points', [])]
@@ -316,14 +322,13 @@ def build(args):
                 a['status'] = 'WAITING_REPAIR' if a['route'] == 'IMAGE2' else 'MANUAL'
         except Exception as exc:
             a.update(status='ERROR', error=str(exc))
-            if isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True) and (job / 'candidates' / f"{a['id']}.png").exists():
+            if (isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True)
+                    and a.get('extraction_method') != 'bright-background'
+                    and (job / 'candidates' / f"{a['id']}.png").exists()):
                 a.update(route='IMAGE2', status='WAITING_REPAIR', repair_mode='extract',
                          routing_history=[{'from': 'AUTO', 'to': 'IMAGE2', 'reason': str(exc)}])
             elif isinstance(exc, ValueError) and a['route'] == 'AUTO' and (job / 'candidates' / f"{a['id']}.png").exists():
-                manual(job, a, 'Local extraction failed; generative repair disabled: ' + str(exc))
-        candidate_path = job / 'candidates' / f"{a['id']}.png"
-        if candidate_path.exists():
-            a['candidate_sha256'] = digest(candidate_path)
+                manual(job, a, 'Local extraction failed; no generative fallback: ' + str(exc))
         save_manifest(job, manifest)
     contact_sheet(job, manifest)
     print(json.dumps({'job': str(job), 'counts': manifest['counts']}, ensure_ascii=False))
@@ -339,25 +344,39 @@ def review(args):
         identifier(aid)
         a = next(a for a in manifest['assets'] if a['id'] == aid)
         path = job / 'review' / f'{aid}.png'
-        if a['status'] != 'REVIEW' or digest(path) != a['review_sha256']:
-            raise ValueError('Review stale or asset not awaiting review')
-        inspect(read_image(path))
         rejected_name = f"{aid}-attempt-{len(a.get('repair_attempts', []))}.png"
         dest = job / 'assets' / path.name if args.decision == 'accept' else job / 'rejected' / rejected_name
-        if dest.exists():
+        pending = {'decision': args.decision, 'note': args.note, 'path': str(dest.relative_to(job))}
+        if a['status'] != 'REVIEW' or (a.get('pending_review') and a['pending_review'] != pending):
+            raise ValueError('Resume the recorded review decision and note before changing it')
+        checked = path if path.exists() else dest
+        if not path.exists() and not a.get('pending_review'):
+            raise ValueError('Missing review file without a recorded decision')
+        if digest(checked) != a['review_sha256']:
+            raise ValueError('Review stale or asset not awaiting review')
+        inspect(read_image(checked))
+        if path.exists() and dest.exists():
             raise ValueError('Destination already exists')
-        selected.append((a, path, dest))
-    for a, path, dest in selected:
-        path.replace(dest)
+        selected.append((a, path, dest, pending))
+    for a, path, dest, pending in selected:
+        # Persist the decision before moving the file, so an interrupted commit
+        # can resume without losing evidence or changing the recorded review.
+        a['pending_review'] = pending
+        save_manifest(job, manifest)
+        if path.exists():
+            path.replace(dest)
         a.update(status='PASS' if args.decision == 'accept' else 'REJECTED',
                  visual_review={'decision': args.decision, 'note': args.note},
                  output_path=str(dest.relative_to(job)), output_sha256=digest(dest))
-        if args.decision == 'reject' and a.get('repair_allowed', True) and (a.get('repair_attempts') or a['route'] == 'AUTO'):
+        if (args.decision == 'reject' and a.get('repair_allowed', True)
+                and a.get('extraction_method') != 'bright-background'
+                and (a.get('repair_attempts') or a['route'] == 'AUTO')):
             a.update(route='IMAGE2', status='WAITING_REPAIR' if len(a.get('repair_attempts', [])) < 2 else 'MANUAL',
                      repair_feedback=args.note)
         if a.get('repair_attempts'):
             a['repair_attempts'][-1].update(status='PASS' if args.decision == 'accept' else 'REJECTED',
                                            review_note=args.note)
+        a.pop('pending_review', None)
         if args.decision == 'reject' and a['status'] in ('MANUAL', 'REJECTED'):
             manual(job, a, args.note)
         save_manifest(job, manifest)
@@ -513,7 +532,8 @@ def status(args):
     for a in manifest['assets']:
         state = a['status']
         if state == 'REVIEW':
-            action = 'view preview, then review accept/reject with observations'
+            action = ('resume review with recorded decision and note' if a.get('pending_review') else
+                      'view preview, then review accept/reject with observations')
         elif state == 'WAITING_REPAIR':
             action = 'view candidate, repair-start, call image_gen once, repair-result'
         elif state in ('REPAIRING', 'REPAIR_BLOCKED'):
@@ -524,7 +544,8 @@ def status(args):
             continue
         actions.append({'id': a['id'], 'status': state, 'next': action,
                         'candidate': str(job / 'candidates' / f"{a['id']}.png"),
-                        'preview': str(job / 'previews' / f"{a['id']}.jpg"),
+                         'preview': str(job / 'previews' / f"{a['id']}.jpg"),
+                        'pending_review': a.get('pending_review'),
                         'error': a.get('error')})
     print(json.dumps({'job': str(job), 'counts': manifest['counts'],
                       'ready_to_finalize': not actions, 'actions': actions}, ensure_ascii=False, indent=2))
@@ -553,8 +574,15 @@ def finalize(args):
             if digest(path) != a['output_sha256']:
                 raise ValueError('Delivered asset changed: ' + a['id'])
             inspect(read_image(path))
-        elif not (job / 'manual' / f"{a['id']}.json").exists():
-            raise ValueError('Missing manual handoff: ' + a['id'])
+        else:
+            for suffix in ('png', 'md', 'json'):
+                if not (job / 'manual' / f"{a['id']}.{suffix}").is_file():
+                    raise ValueError('Missing manual handoff: ' + a['id'] + '.' + suffix)
+            if digest(job / 'manual' / f"{a['id']}.png") != digest(job / 'candidates' / f"{a['id']}.png"):
+                raise ValueError('Manual crop changed: ' + a['id'])
+            handoff = json.loads((job / 'manual' / f"{a['id']}.json").read_text(encoding='utf-8'))
+            if handoff.get('id') != a['id'] or handoff.get('status') != 'MANUAL':
+                raise ValueError('Invalid manual handoff: ' + a['id'])
     report = {'environment': manifest.get('environment'), 'discovery': manifest.get('discovery'), 'counts': manifest['counts'],
               'local_pass': sum(a['status'] == 'PASS' and not a['generated_repair'] for a in manifest['assets']),
               'generated_pass': sum(a['status'] == 'PASS' and a['generated_repair'] for a in manifest['assets']),

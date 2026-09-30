@@ -5,6 +5,8 @@ from pathlib import Path
 import tempfile
 import shutil
 import sys
+import contextlib
+import io
 from unittest.mock import patch
 
 import numpy as np
@@ -32,6 +34,36 @@ def main():
     assert extracted.getpixel((50, 60)) == (25, 30, 35, 255)
     assert extracted.getpixel((5, 5))[3] == 0 and extracted.getpixel((15, 5))[3] == 0
     j.inspect(extracted)
+    # A transparent border must never conceal a clipped or unremoved crop.
+    with tempfile.TemporaryDirectory(prefix='asset-local-gates-') as tmp:
+        root = Path(tmp)
+        clipped = Image.new('RGB', (80, 80), (246, 244, 238))
+        ImageDraw.Draw(clipped).rectangle((0, 20, 60, 60), fill='orange')
+        clipped.save(root / 'clipped.png')
+        checker.save(root / 'checker.png')
+        Image.new('RGB', (80, 80), 'white').save(root / 'light.png')
+        local = {'id': 'clipped', 'source_id': 'clipped', 'label': 'square', 'bbox': [0, 0, 80, 80],
+                 'route': 'A', 'reason': 'Synthetic local gate', 'background_rgb': [246, 244, 238]}
+        plan = {'sources': [{'id': name, 'path': str(root / f'{name}.png')}
+                            for name in ('clipped', 'checker', 'light')],
+                'candidates': [local, dict(local, id='strict_clipped', repair_allowed=False),
+                               dict(local, id='bright_failed', source_id='light', extraction_method='bright-background'),
+                               dict(local, id='bright_rejected', source_id='checker', bbox=[0, 0, 100, 120],
+                                    extraction_method='bright-background'),
+                               dict(local, id='photo', bbox=[20, 20, 61, 61], extraction_method='crop')]}
+        pp = root / 'plan.json'
+        pp.write_text(json.dumps(plan), encoding='utf-8')
+        job = root / 'job'
+        j.build(ns(plan=pp, job=job))
+        _, m = j.load_job(job)
+        assert m['assets'][0]['status'] == 'WAITING_REPAIR', 'Padding hid a clipped target'
+        assert m['assets'][1]['status'] == 'MANUAL', 'Strict clipping must stay local/manual'
+        assert m['assets'][2]['status'] == 'MANUAL', 'Bright-background failure must not generate'
+        j.review(ns(job=job, id=['bright_rejected'], decision='reject', note='Synthetic edge rejection'))
+        _, m = j.load_job(job)
+        assert m['assets'][3]['status'] == 'MANUAL' and not m['assets'][3].get('repair_attempts')
+        photo = j.read_image(job / 'review' / 'photo.png')
+        assert np.array_equal(np.asarray(photo)[12:-12, 12:-12], np.asarray(clipped.convert('RGBA'))[20:61, 20:61])
     with tempfile.TemporaryDirectory(prefix='asset-builtin-test-') as tmp:
         root = Path(tmp)
         source = Image.new('RGB', (80, 80), (246, 244, 238))
@@ -129,10 +161,59 @@ def main():
         assert len(list((strict_job / 'manual').glob('*.json'))) == 3
         j.finalize(ns(job=strict_job))
         j.verify(ns(job=strict_job))
+        for suffix in ('png', 'md', 'json'):
+            handoff = strict_job / 'manual' / f'strict.{suffix}'
+            saved = handoff.read_bytes()
+            handoff.unlink()
+            try:
+                j.finalize(ns(job=strict_job))
+            except (ValueError, FileNotFoundError):
+                pass
+            else:
+                raise AssertionError(f'Incomplete manual handoff delivered without {suffix}')
+            finally:
+                handoff.write_bytes(saved)
+        # An interrupted accept/reject resumes the same recorded decision.
+        plan['candidates'] = [dict(strict, id='accept_resume', route='A', background_rgb=[246, 244, 238]),
+                              dict(strict, id='reject_resume', route='A', background_rgb=[246, 244, 238])]
+        (root / 'resume.json').write_text(json.dumps(plan), encoding='utf-8')
+        resume_job = root / 'review-resume'
+        j.build(ns(plan=root / 'resume.json', job=resume_job))
+        for aid, decision in [('accept_resume', 'accept'), ('reject_resume', 'reject')]:
+            original_save = j.save_manifest
+
+            def interrupt_after_move(job_path, manifest):
+                if not (job_path / 'review' / f'{aid}.png').exists():
+                    raise OSError('simulated review interruption')
+                return original_save(job_path, manifest)
+
+            args = ns(job=resume_job, id=[aid], decision=decision, note='Synthetic review recovery')
+            with patch.object(j, 'save_manifest', side_effect=interrupt_after_move):
+                try:
+                    j.review(args)
+                except OSError:
+                    pass
+                else:
+                    raise AssertionError('Review fault injection did not execute')
+            with contextlib.redirect_stdout(io.StringIO()) as captured:
+                j.status(ns(job=resume_job))
+            action = next(a for a in json.loads(captured.getvalue())['actions'] if a['id'] == aid)
+            assert action['pending_review']['decision'] == decision
+            try:
+                j.review(ns(job=resume_job, id=[aid], decision='reject' if decision == 'accept' else 'accept',
+                            note=args.note))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError('An interrupted review changed its decision')
+            j.review(args)
+        j.finalize(ns(job=resume_job))
+        j.verify(ns(job=resume_job))
         if len(sys.argv) == 3 and sys.argv[1] == '--output':
             destination = Path(sys.argv[2]).resolve()
             shutil.copytree(job, destination / 'synthetic-workflow')
             shutil.copytree(strict_job, destination / 'strict-workflow')
+            shutil.copytree(resume_job, destination / 'review-resume')
         (job / 'assets' / 'b.png').write_bytes(b'changed')
         try:
             j.verify(ns(job=job))

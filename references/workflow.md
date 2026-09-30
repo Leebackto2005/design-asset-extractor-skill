@@ -40,7 +40,7 @@ ID 仅 ASCII 字母、数字、下划线、连字符且唯一。bbox=[left,top,r
 
 A 必填采样 background_rgb，可选 background_points 标记真实内孔，可选 foreground_points 选择目标连通组件。脚本保留不与背景连通的内部浅色内容。颜色阈值仅为平底启发式，不代表质量评分。
 
-A 的默认 extraction_method=matte 使用上述颜色参数。另支持 `crop`（精确矩形裁切，padding 默认 12 像素）和 `bright-background`（浅色背景上的深色不透明主体，用 GrabCut 分割并向内软化边缘）；后两者不需要 background_rgb。crop 保留照片内部背景，仅外围透明。bright-background 不是通用语义分割，对浅色主体/高光/玻璃不适用，必须检查深浅底。若源是模型生成回图，候选必须标记 generated_source=true，并在 reason 中关联原任务/尝试。两种本地输出都先 REVIEW，不能自动 PASS。
+A 的默认 extraction_method=matte 使用上述颜色参数，先检查未加边距的提取结果，再添加透明外边距；padding 默认 12，matte 可设 0，其余方法为 1..512 的整数。另支持 `crop`（完整矩形照片裁切）和 `bright-background`（浅色背景上的深色不透明主体，用 GrabCut 分割并向内软化边缘）；后两者不需要 background_rgb。crop 保留照片内部背景，仅外围透明，不能用来掩盖主体裁断或抠图失败。bright-background 不是通用语义分割，对浅色主体/高光/玻璃不适用，必须检查深浅底，处理失败或视觉拒绝均转人工。若源是模型生成回图，候选必须标记 generated_source=true，并在 reason 中关联原任务/尝试。所有本地输出都先 REVIEW，不能自动 PASS。
 
 ```text
 python asset_job.py build --plan plan.json --job 新任务目录
@@ -48,7 +48,7 @@ python asset_job.py repair-queue --job 任务目录
 python asset_job.py repair-start --job 任务目录 --id source_001_turtle
 ```
 
-build 不调用内置工具；队列由 Codex 继续执行。每次新建任务避免覆盖旧来源。A 数据检查失败会带原因进入 B；非处理错误仍为 ERROR，不混同人工判断。
+build 不调用内置工具；队列由 Codex 继续执行。每次新建任务避免覆盖旧来源。普通 A 质量检查失败且允许生成式修补时带原因进入 B；repair_allowed=false 或 bright-background 失败进入人工队列。计划参数无效时拒绝建任务；非处理错误仍为 ERROR，不混同人工判断。
 
 ## 内置工具调用与结果导入
 
@@ -61,7 +61,7 @@ python asset_job.py review --job 任务目录 --id source_001_turtle --decision 
 
 仅工具实际返回模型信息时加 --model；工具结果 ID 可用 --tool-reference 记录。图片先复制到 repaired/id-attempt-N.png，透明检查通过后写 review、masks、previews，等视觉复核放行。已有 Alpha 原样保留。没有真实透明、主体被裁切或全透明均不通过；第一次回到队列，第二次转人工。
 
-视觉不合格用 review --decision reject --note 具体问题；保留拒绝文件，最多再修一次。某次调用中断或返回不明：
+视觉不合格用 review --decision reject --note 具体问题；保留拒绝文件，允许生成式修补时最多再修一次，严格模式及 bright-background 拒绝后转人工。审核前先保存 decision、note 和目标路径；若移文件或提交状态时中断，status 会返回 pending_review，用同一候选及已记录的 decision、note 再运行 review，不能改成另一种决定。已完成的候选无需再审核。某次工具调用中断或返回不明：
 
 ```text
 python asset_job.py repair-result --job 任务目录 --id source_001_turtle --failure "工具超时，是否生成未知"
@@ -85,7 +85,7 @@ python scripts/asset_job.py finalize --job 任务目录
 python scripts/asset_job.py verify --job 任务目录
 ```
 
-status 返回每个未解决候选的下一步动作及原图/预览路径。Codex 循环执行动作直到 PASS/MANUAL 或明确外部阻塞。finalize 拒绝任何未解决候选，校验 PASS 文件，输出 `delivery.json`（本地通过、生成通过、人工数量及文件路径）和 `checksums.json`。整个目录包含计划、源图快照、候选、每次回图、审核及人工任务，可整体复制后 verify。verify 检查清单文件是否缺失或改变；这不是防恶意修改的签名，也不重新证明视觉质量。任务被修改后需重新 finalize。
+status 返回每个未解决候选的下一步动作及原图/预览路径。Codex 循环执行动作直到 PASS/MANUAL 或明确外部阻塞。finalize 拒绝任何未解决候选，校验 PASS 文件，并检查人工任务的 PNG、Markdown、JSON 是否齐全及任务图是否与原候选一致，输出 `delivery.json`（本地通过、生成通过、人工数量及文件路径）和 `checksums.json`。整个目录包含计划、源图快照、候选、每次回图、审核及人工任务，可整体复制后 verify。verify 检查清单文件是否缺失或改变；这不是防恶意修改的签名，也不重新证明视觉质量。任务被修改后需重新 finalize。
 
 导入在保存回图后中断，可对同一次请求再次 repair-result；已有回图必须与传入图片像素一致，不覆盖另一张图。B + repair_allowed=false、A 严格模式质量失败、修补两次失败均转人工并生成图和原因。人工处理的完成不由脚本假定。
 
