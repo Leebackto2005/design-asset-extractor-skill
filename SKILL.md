@@ -11,6 +11,18 @@ description: 自动发现图片中可复用设计素材并按 A/B/C 分流：A �
 
 ## 0. 自动执行与复现
 
+### 安装与首次环境检查
+
+首次安装时，可将下面这段发送给 Codex；已安装时复用现有 Skill，执行环境与工具检查。
+
+```text
+使用 $skill-installer 安装这个仓库中的 design-asset-extractor Skill：
+https://github.com/Leebackto2005/design-asset-extractor-skill
+
+安装后检查 Python 3.12，运行 scripts/bootstrap.ps1 创建独立环境并完成测试。
+同时检查当前会话是否能调用内置图片生成／编辑工具。
+```
+
 首次使用按 [执行接口](references/workflow.md) 创建项目独立环境并运行测试，后续使用该环境的 Python。自动执行依赖准备、inventory、看图写计划、build、状态循环及 finalize/verify；用户只需提供源图片，不要求逐项批准计划或填写技术字段。网络或工具权限按宿主要求处理。
 
 每轮运行 `status --job`：REVIEW 查看原图与深浅底预览后审核；若有 pending_review，用其中记录的 decision 和 note 恢复该候选的审核；WAITING_REPAIR 串行处理内置工具队列；REPAIRING/REPAIR_BLOCKED 只查找原调用结果并恢复；ERROR 检查本地错误并修复，不能解决则报告具体障碍。全部 PASS/MANUAL 后 finalize、verify，再交付素材及人工清单。有未解决状态时只报告部分结果，不宣布完成。两次修补失败会自动生成完整人工任务包，不要求用户搬运文件。
