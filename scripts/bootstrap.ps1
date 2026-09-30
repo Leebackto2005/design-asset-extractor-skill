@@ -28,4 +28,6 @@ if ($LASTEXITCODE -ne 0) { throw 'Workflow test failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Parallel workflow test failed' }
 & $runner (Join-Path $PSScriptRoot 'test_portrait.py')
 if ($LASTEXITCODE -ne 0) { throw 'Portrait workflow test failed' }
+& $runner (Join-Path $PSScriptRoot 'test_efficiency.py')
+if ($LASTEXITCODE -ne 0) { throw 'Efficiency workflow test failed' }
 Write-Output "READY: $runner"

@@ -11,6 +11,7 @@ import math
 import errno
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -19,6 +20,29 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 import PIL
+
+
+_hashes = ContextVar('command_hashes', default=None)
+
+
+@contextmanager
+def hash_scope():
+    if _hashes.get() is not None:
+        yield
+        return
+    token = _hashes.set({})
+    try:
+        yield
+    finally:
+        _hashes.reset(token)
+
+
+def hash_command(function):
+    @wraps(function)
+    def run(args):
+        with hash_scope():
+            return function(args)
+    return run
 
 
 @contextmanager
@@ -52,7 +76,8 @@ def job_lock(path):
                     raise TimeoutError('Job busy; retry the local command, not the image request') from exc
                 time.sleep(0.05)
         try:
-            yield
+            with hash_scope():
+                yield
         finally:
             lock(unlock=True)
 
@@ -101,13 +126,42 @@ def manual(job, asset, reason):
         f"Crop: {aid}.png\n\nAttempts and review: {aid}.json\n", encoding='utf-8')
 
 
-def digest(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def file_signature(path):
+    stat = Path(path).stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def hash_file(path):
+    result = hashlib.sha256()
+    with Path(path).open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            result.update(chunk)
+    return result.hexdigest()
+
+
+def digest(path, fresh=False):
+    path = Path(path).resolve()
+    before = file_signature(path)
+    memo = _hashes.get()
+    if not fresh and memo is not None and memo.get(path, (None,))[0] == before:
+        return memo[path][1]
+    result = hash_file(path)
+    if file_signature(path) != before:
+        raise ValueError('File changed while hashing: ' + str(path))
+    if memo is not None and not fresh:
+        memo[path] = (before, result)
+    return result
 
 
 def read_image(path):
     with Image.open(path) as im:
         return ImageOps.exif_transpose(im).convert('RGBA')
+
+
+def image_size(path):
+    # Read metadata only. Extraction applies the same EXIF orientation later.
+    with Image.open(path) as im:
+        return im.size[::-1] if im.getexif().get(274) in (5, 6, 7, 8) else im.size
 
 
 def identifier(value):
@@ -283,7 +337,8 @@ def process(job, asset, im, background=None, points=(), foreground_points=()):
     output.getchannel('A').save(job / 'masks' / f'{aid}.png')
     output.save(job / 'review' / f'{aid}.png')
     preview(im, output, job / 'previews' / f'{aid}.jpg')
-    asset.update(status='REVIEW', metrics=metrics, review_sha256=digest(job / 'review' / f'{aid}.png'))
+    asset.update(status='REVIEW', metrics=metrics, review_sha256=digest(job / 'review' / f'{aid}.png'),
+                 preview_sha256=digest(job / 'previews' / f'{aid}.jpg'))
 
 
 def compose_portrait(im, layout):
@@ -400,7 +455,8 @@ def portrait_layout(args):
     output.save(review_path)
     output.getchannel('A').save(job / 'masks' / f"{a['id']}.png")
     preview(read_image(job / 'candidates' / f"{a['id']}.png"), output, job / 'previews' / f"{a['id']}.jpg")
-    a.update(portrait_layout=record, metrics=inspect(output, allow_bottom=True), review_sha256=digest(review_path))
+    a.update(portrait_layout=record, metrics=inspect(output, allow_bottom=True), review_sha256=digest(review_path),
+             preview_sha256=digest(job / 'previews' / f"{a['id']}.jpg"))
     a.pop('pending_portrait', None)
     contact_sheet(job, manifest)
     save_manifest(job, manifest)
@@ -431,15 +487,70 @@ def inspect_asset(job, asset, im):
 def contact_sheet(job, manifest):
     files = [(a['id'], job / 'previews' / (a['id'] + '.jpg')) for a in manifest['assets']]
     files = [(aid, path) for aid, path in files if path.exists()]
-    for start in range(0, len(files), 12):
-        chunk = files[start:start + 12]
-        sheet = Image.new('RGB', (450, 195 * len(chunk)), 'white')
+    for start in range(0, len(files), 8):
+        chunk = files[start:start + 8]
+        sheet = Image.new('RGB', (900, 375 * len(chunk)), 'white')
         draw = ImageDraw.Draw(sheet)
         for i, (aid, path) in enumerate(chunk):
-            draw.text((10, i * 195 + 3), aid, fill='black')
+            draw.text((10, i * 375 + 3), aid, fill='black')
             with Image.open(path) as im:
-                sheet.paste(im.resize((450, 175)), (0, i * 195 + 20))
-        sheet.save(job / 'previews' / f'contact_{start // 12 + 1:02d}.jpg')
+                sheet.paste(im, (0, i * 375 + 20))
+        sheet.save(job / 'previews' / f'contact_{start // 8 + 1:02d}.jpg')
+    write_review_sheets(job, manifest)
+
+
+def review_kind(asset):
+    if (asset.get('portrait') or asset.get('generated_repair') or asset.get('requires_detail_review')
+            or asset.get('pending_review') or asset.get('pending_portrait')
+            or asset.get('route') != 'AUTO' or asset.get('extraction_method', 'matte') not in ('matte', 'crop')
+            or not asset.get('preview_sha256')):
+        return 'detail'
+    bounds = asset.get('metrics', {}).get('foreground_bbox', [0, 0, 0, 0])
+    return 'batch' if min(bounds[2] - bounds[0], bounds[3] - bounds[1]) >= 24 else 'detail'
+
+
+def write_review_sheets(job, manifest, batch_size=8):
+    if type(batch_size) is not int or not 1 <= batch_size <= 12:
+        raise ValueError('batch-size must be an integer in 1..12')
+    assets = [a for a in manifest['assets'] if a['status'] == 'REVIEW' and review_kind(a) == 'batch']
+    batches = []
+    for start in range(0, len(assets), batch_size):
+        chunk = assets[start:start + batch_size]
+        rows = []
+        for a in chunk:
+            for folder, suffix, field in [('candidates', '.png', 'candidate_sha256'),
+                                           ('review', '.png', 'review_sha256'), ('previews', '.jpg', 'preview_sha256')]:
+                if digest(job / folder / (a['id'] + suffix)) != a[field]:
+                    raise ValueError('Batch input changed: ' + a['id'])
+            rows.append({k: a[k] for k in ('id', 'candidate_sha256', 'review_sha256', 'preview_sha256')})
+        key = hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()[:20]
+        image_path, index_path = job / 'previews' / f'fast-{key}.jpg', job / 'previews' / f'fast-{key}.json'
+        if index_path.exists():
+            index = json.loads(index_path.read_text(encoding='utf-8'))
+            if index['rows'] != rows or digest(image_path) != index['image_sha256']:
+                raise ValueError('Saved review sheet changed')
+        else:
+            sheet = Image.new('RGB', (900, 375 * len(rows)), 'white')
+            draw = ImageDraw.Draw(sheet)
+            for i, a in enumerate(chunk):
+                draw.text((10, 375 * i + 3), a['id'] + ' | A / QC checked / batch review', fill='black')
+                with Image.open(job / 'previews' / f"{a['id']}.jpg") as im:
+                    sheet.paste(im, (0, 375 * i + 20))
+            sheet.save(image_path)
+            index = {'image': str(image_path.relative_to(job)), 'image_sha256': digest(image_path), 'rows': rows}
+            index_path.write_text(json.dumps(index, indent=2), encoding='utf-8')
+        batches.append({'index': str(index_path), 'index_sha256': digest(index_path), 'image': str(image_path),
+                        'ids': [a['id'] for a in chunk]})
+    return batches
+
+
+@locked_job
+def review_sheet(args):
+    job, manifest = load_job(args.job)
+    batches = write_review_sheets(job, manifest, getattr(args, 'batch_size', 8))
+    print(json.dumps({'batches': batches, 'detail_ids': [a['id'] for a in manifest['assets']
+                     if a['status'] == 'REVIEW' and review_kind(a) == 'detail']}, ensure_ascii=False))
+    return 0
 
 
 def validate_plan(plan, base):
@@ -450,7 +561,7 @@ def validate_plan(plan, base):
             raise ValueError('Duplicate source ID')
         path = Path(source['path'])
         path = (base / path).resolve() if not path.is_absolute() else path.resolve()
-        sources[sid] = (path, read_image(path).size)
+        sources[sid] = (path, image_size(path))
     for a in plan['candidates']:
         a['route'] = {'A': 'AUTO', 'B': 'IMAGE2', 'C': 'MANUAL'}.get(a.get('route'), a.get('route'))
         aid = identifier(a['id'])
@@ -461,6 +572,8 @@ def validate_plan(plan, base):
             raise ValueError('Missing label/reason or invalid route')
         if 'portrait' in a and type(a['portrait']) is not bool:
             raise ValueError('portrait must be a boolean for explicitly requested portrait mode')
+        if 'requires_detail_review' in a and type(a['requires_detail_review']) is not bool:
+            raise ValueError('requires_detail_review must be a boolean')
         _, size = sources[a['source_id']]
         box = a['bbox']
         if len(box) != 4 or any(type(x) is not int for x in box):
@@ -496,12 +609,13 @@ def validate_plan(plan, base):
     return sources
 
 
-def build_candidate(job, candidate):
+def build_candidate(job, candidate, source_images=None):
     # Workers own unique asset files; only the build thread writes the manifest.
     a = dict(candidate, status='ERROR', generated_repair=bool(candidate.get('generated_source', False)))
     a.setdefault('initial_route', a['route'])
     try:
-        crop = read_image(job / 'source' / f"{a['source_id']}.png").crop(a['bbox'])
+        source = (source_images or {}).get(a['source_id'])
+        crop = (source if source is not None else read_image(job / 'source' / f"{a['source_id']}.png")).crop(a['bbox'])
         crop.save(job / 'candidates' / f"{a['id']}.png")
         a['candidate_sha256'] = digest(job / 'candidates' / f"{a['id']}.png")
         if a['route'] == 'AUTO':
@@ -529,6 +643,7 @@ def build_candidate(job, candidate):
     return a
 
 
+@hash_command
 def build(args):
     workers = getattr(args, 'workers', 5)
     if type(workers) is not int or workers < 1:
@@ -539,6 +654,10 @@ def build(args):
     plan_path = Path(args.plan).resolve()
     plan = json.loads(plan_path.read_text(encoding='utf-8-sig'))
     sources = validate_plan(plan, plan_path.parent)
+    source_hashes = {sid: digest(path) for sid, (path, _) in sources.items()}
+    for source in plan['sources']:
+        if source.get('sha256') and source['sha256'] != source_hashes[source['id']]:
+            raise ValueError('Discovery source changed; refresh the plan: ' + source['id'])
     for a in plan['candidates']:
         a['initial_route'] = a['route']
         if processing == 'local-first' and not (a.get('portrait') or
@@ -560,75 +679,151 @@ def build(args):
                     'sources': [], 'assets': [dict(a, status='ERROR', error='Local processing not completed')
                                              for a in plan['candidates']]}
         shutil.copyfile(plan_path, job / 'plan.json')
+        source_images, decoded_bytes = {}, 0
         for sid, (path, size) in sources.items():
-            read_image(path).save(job / 'source' / f'{sid}.png')
-            manifest['sources'].append({'id': sid, 'original_path': str(path), 'sha256': digest(path), 'size': list(size),
+            source = read_image(path)
+            if source.size != size or digest(path) != source_hashes[sid]:
+                raise ValueError('Source changed during build: ' + sid)
+            source.save(job / 'source' / f'{sid}.png')
+            # ponytail: bounded shared read-only decode cache; very large sources fall back to disk.
+            cost = source.width * source.height * 4
+            if decoded_bytes + cost <= 256 * 1024 * 1024:
+                source_images[sid] = source
+                decoded_bytes += cost
+            manifest['sources'].append({'id': sid, 'original_path': str(path), 'sha256': source_hashes[sid], 'size': list(size),
                                         'snapshot_sha256': digest(job / 'source' / f'{sid}.png')})
         save_manifest(job, manifest)
         local_workers = min(workers, len(plan['candidates']))
         with ThreadPoolExecutor(max_workers=local_workers) as pool:
-            futures = {pool.submit(build_candidate, job, a): i for i, a in enumerate(plan['candidates'])}
+            futures = {pool.submit(build_candidate, job, a, source_images): i for i, a in enumerate(plan['candidates'])}
             for future in as_completed(futures):
                 manifest['assets'][futures[future]] = future.result()
                 save_manifest(job, manifest)
         contact_sheet(job, manifest)
         print(json.dumps({'job': str(job), 'counts': manifest['counts'], 'local_workers': local_workers,
+                          'decoded_source_cache_count': len(source_images),
                           'capacity': repair_capacity(manifest)}, ensure_ascii=False))
         return 1 if manifest['counts']['ERROR'] else 0
+
+
+def prepare_review(job, asset, decision, note):
+    if decision not in ('accept', 'reject') or not isinstance(note, str) or not note.strip():
+        raise ValueError('Review requires an actual observation')
+    aid = identifier(asset['id'])
+    if asset.get('pending_portrait'):
+        raise ValueError('Resume portrait-layout before reviewing')
+    path = job / 'review' / f'{aid}.png'
+    rejected_name = f"{aid}-attempt-{len(asset.get('repair_attempts', []))}.png"
+    dest = job / 'assets' / path.name if decision == 'accept' else job / 'rejected' / rejected_name
+    pending = {'decision': decision, 'note': note, 'path': str(dest.relative_to(job))}
+    if asset['status'] != 'REVIEW' or (asset.get('pending_review') and asset['pending_review'] != pending):
+        raise ValueError('Resume the recorded review decision and note before changing it')
+    checked = path if path.exists() else dest
+    if not path.exists() and not asset.get('pending_review'):
+        raise ValueError('Missing review file without a recorded decision')
+    if digest(checked) != asset['review_sha256']:
+        raise ValueError('Review stale or asset not awaiting review')
+    if decision == 'accept':
+        inspect_asset(job, asset, read_image(checked))
+    else:
+        inspect(read_image(checked), allow_bottom=bool(asset.get('portrait')))
+    if path.exists() and dest.exists():
+        raise ValueError('Destination already exists')
+    return asset, path, dest, pending
+
+
+def commit_reviews(job, manifest, selected):
+    # Record the whole transaction before moving any files. Resume each pending
+    # decision with its original note if a batch is interrupted midway.
+    for a, _, _, pending in selected:
+        a['pending_review'] = pending
+    save_manifest(job, manifest)
+    for a, path, dest, pending in selected:
+        decision, note = pending['decision'], pending['note']
+        if path.exists():
+            path.replace(dest)
+        a.update(status='PASS' if decision == 'accept' else 'REJECTED',
+                 visual_review={'decision': decision, 'note': note, 'batch': a.get('batch_review'),
+                                'mode': 'batch' if a.get('batch_review') and not a.get('requires_detail_review') else 'detail'},
+                 output_path=str(dest.relative_to(job)), output_sha256=a['review_sha256'])
+        if (decision == 'reject' and a.get('repair_allowed', True)
+                and (a.get('portrait') or a.get('extraction_method') != 'bright-background')
+                and (a.get('repair_attempts') or a['route'] == 'AUTO')):
+            a.update(route='IMAGE2', status='WAITING_REPAIR' if len(a.get('repair_attempts', [])) < 2 else 'MANUAL',
+                     repair_feedback=note)
+        if a.get('repair_attempts'):
+            a['repair_attempts'][-1].update(status='PASS' if decision == 'accept' else 'REJECTED', review_note=note)
+        a.pop('pending_review', None)
+        if decision == 'reject' and a['status'] in ('MANUAL', 'REJECTED'):
+            manual(job, a, note)
+    save_manifest(job, manifest)
 
 
 @locked_job
 def review(args):
     job, manifest = load_job(args.job)
-    if not args.note.strip():
-        raise ValueError('Review requires an actual observation')
-    selected = []
-    for aid in dict.fromkeys(args.id):
-        identifier(aid)
-        a = next(a for a in manifest['assets'] if a['id'] == aid)
-        if a.get('pending_portrait'):
-            raise ValueError('Resume portrait-layout before reviewing')
-        path = job / 'review' / f'{aid}.png'
-        rejected_name = f"{aid}-attempt-{len(a.get('repair_attempts', []))}.png"
-        dest = job / 'assets' / path.name if args.decision == 'accept' else job / 'rejected' / rejected_name
-        pending = {'decision': args.decision, 'note': args.note, 'path': str(dest.relative_to(job))}
-        if a['status'] != 'REVIEW' or (a.get('pending_review') and a['pending_review'] != pending):
-            raise ValueError('Resume the recorded review decision and note before changing it')
-        checked = path if path.exists() else dest
-        if not path.exists() and not a.get('pending_review'):
-            raise ValueError('Missing review file without a recorded decision')
-        if digest(checked) != a['review_sha256']:
-            raise ValueError('Review stale or asset not awaiting review')
-        if args.decision == 'accept':
-            inspect_asset(job, a, read_image(checked))
-        else:
-            inspect(read_image(checked), allow_bottom=bool(a.get('portrait')))
-        if path.exists() and dest.exists():
-            raise ValueError('Destination already exists')
-        selected.append((a, path, dest, pending))
-    for a, path, dest, pending in selected:
-        # Persist the decision before moving the file, so an interrupted commit
-        # can resume without losing evidence or changing the recorded review.
-        a['pending_review'] = pending
-        save_manifest(job, manifest)
-        if path.exists():
-            path.replace(dest)
-        a.update(status='PASS' if args.decision == 'accept' else 'REJECTED',
-                 visual_review={'decision': args.decision, 'note': args.note},
-                 output_path=str(dest.relative_to(job)), output_sha256=digest(dest))
-        if (args.decision == 'reject' and a.get('repair_allowed', True)
-                and (a.get('portrait') or a.get('extraction_method') != 'bright-background')
-                and (a.get('repair_attempts') or a['route'] == 'AUTO')):
-            a.update(route='IMAGE2', status='WAITING_REPAIR' if len(a.get('repair_attempts', [])) < 2 else 'MANUAL',
-                     repair_feedback=args.note)
-        if a.get('repair_attempts'):
-            a['repair_attempts'][-1].update(status='PASS' if args.decision == 'accept' else 'REJECTED',
-                                           review_note=args.note)
-        a.pop('pending_review', None)
-        if args.decision == 'reject' and a['status'] in ('MANUAL', 'REJECTED'):
-            manual(job, a, args.note)
-        save_manifest(job, manifest)
+    selected = [prepare_review(job, next(a for a in manifest['assets'] if a['id'] == aid), args.decision, args.note)
+                for aid in dict.fromkeys(args.id)]
+    commit_reviews(job, manifest, selected)
     print(json.dumps(manifest['counts']))
+    return 0
+
+
+@locked_job
+def review_batch(args):
+    job, manifest = load_job(args.job)
+    index_path = Path(args.sheet).resolve()
+    if not index_path.is_relative_to(job):
+        raise ValueError('Batch index must belong to this job')
+    data = json.loads(Path(args.decisions).read_text(encoding='utf-8-sig'))
+    index_sha = digest(index_path)
+    if data.get('index_sha256') != index_sha:
+        raise ValueError('Batch decisions refer to a different index')
+    index = json.loads(index_path.read_text(encoding='utf-8'))
+    image_path = (job / index['image']).resolve()
+    if not image_path.is_relative_to(job) or digest(image_path) != index['image_sha256']:
+        raise ValueError('Batch image changed')
+    decisions = data['decisions']
+    if (len(decisions) != len(index['rows']) or len({d['id'] for d in decisions}) != len(decisions)
+            or {d['id'] for d in decisions} != {r['id'] for r in index['rows']}):
+        raise ValueError('Batch decisions must cover every indexed ID exactly once')
+    by_id = {d['id']: d for d in decisions}
+    info = {'index': str(index_path.relative_to(job)), 'index_sha256': index_sha, 'image_sha256': index['image_sha256']}
+    selected, details = [], []
+    for row in index['rows']:
+        a = next(a for a in manifest['assets'] if a['id'] == row['id'])
+        d = by_id[a['id']]
+        decision = {'PASS': 'accept', 'REJECT': 'reject', 'DETAIL': 'detail'}.get(d['decision'], d['decision'])
+        note = d.get('note')
+        if decision not in ('accept', 'reject', 'detail') or not isinstance(note, str) or not note.strip():
+            raise ValueError('Each batch decision needs a valid decision and actual observation')
+        if any(a.get(k) != row[k] for k in ('candidate_sha256', 'review_sha256', 'preview_sha256')):
+            raise ValueError('Batch review is stale: ' + a['id'])
+        if digest(job / 'candidates' / f"{a['id']}.png") != row['candidate_sha256']:
+            raise ValueError('Batch source changed')
+        if digest(job / 'previews' / f"{a['id']}.jpg") != row['preview_sha256']:
+            raise ValueError('Batch preview changed')
+        if a['status'] != 'REVIEW':
+            previous = a.get('visual_review', {})
+            if a.get('batch_review') != info or previous.get('decision') != decision or previous.get('note') != note:
+                raise ValueError('Cannot change a completed batch decision')
+            if digest(job / a['output_path']) != a['output_sha256']:
+                raise ValueError('Completed batch output changed')
+            continue
+        if review_kind(a) != 'batch' and a.get('batch_review') != info:
+            raise ValueError('This asset requires individual review')
+        if decision == 'detail':
+            if a.get('pending_review') or digest(job / 'review' / f"{a['id']}.png") != row['review_sha256']:
+                raise ValueError('Resume pending review before requesting detail')
+            details.append((a, note))
+        else:
+            selected.append(prepare_review(job, a, decision, note))
+    for a, _, _, _ in selected:
+        a['batch_review'] = info
+    for a, note in details:
+        a.update(requires_detail_review=True, detail_note=note, batch_review=info)
+    commit_reviews(job, manifest, selected)
+    print(json.dumps({'counts': manifest['counts'], 'detail_ids': [a['id'] for a, _ in details]}))
     return 0
 
 
@@ -659,6 +854,22 @@ def repaired(args):
     return 0
 
 
+DISCOVERY_VERSION = 1
+
+
+def json_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
+
+
+def atomic_json(path, value):
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False) as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        temporary = Path(stream.name)
+    temporary.replace(path)
+
+
+@hash_command
 def inventory(args):
     files = set()
     for raw in args.input:
@@ -671,14 +882,132 @@ def inventory(args):
             raise ValueError('Input does not exist')
     if not files:
         raise ValueError('No input images')
-    sources = [{'id': f'source_{i:03d}', 'path': str(p), 'size': list(read_image(p).size), 'sha256': digest(p)}
-               for i, p in enumerate(sorted(files), 1)]
+    proxy_size = getattr(args, 'proxy_size', 1024)
+    if type(proxy_size) is not int or not 256 <= proxy_size <= 2048:
+        raise ValueError('proxy-size must be an integer in 256..2048')
+    intent = getattr(args, 'intent', 'reusable-design-assets')
+    if not isinstance(intent, str) or not intent.strip():
+        raise ValueError('Discovery intent must describe the actual request')
     output = Path(args.output).resolve()
+    if output.exists():
+        raise FileExistsError('Inventory output already exists')
+    sources = [{'id': f'source_{i:03d}', 'path': str(p), 'size': list(image_size(p)), 'sha256': digest(p)}
+               for i, p in enumerate(sorted(files), 1)]
+    profile = {'version': DISCOVERY_VERSION, 'script_sha256': digest(__file__), 'intent': intent,
+               'proxy_size': proxy_size, 'sources': [{k: s[k] for k in ('id', 'sha256', 'size')} for s in sources]}
+    key = json_digest(profile)
+    cache_root = Path(getattr(args, 'cache_dir', None) or Path.home() / '.cache' / 'design-asset-extractor' / 'discovery').resolve()
+    entry = cache_root / key
+    entry.mkdir(parents=True, exist_ok=True)
+    with job_lock(entry):
+        proxies_path = entry / 'proxies.json'
+        try:
+            proxies = json.loads(proxies_path.read_text(encoding='utf-8'))
+            if not isinstance(proxies, dict):
+                proxies = {}
+        except (OSError, ValueError):
+            proxies = {}
+        for source in sources:
+            path = entry / f"{source['id']}.png"
+            previous = proxies.get(source['id'], {})
+            if (not isinstance(previous, dict) or not isinstance(previous.get('size'), list)
+                    or len(previous['size']) != 2 or any(type(v) is not int or v <= 0 for v in previous['size'])):
+                previous = {}
+            if (not path.exists() or digest(path) != previous.get('sha256')
+                    or list(image_size(path)) != previous.get('size')):
+                im = read_image(source['path'])
+                if im.size != tuple(source['size']) or digest(source['path']) != source['sha256']:
+                    raise ValueError('Source changed during discovery')
+                im.thumbnail((proxy_size, proxy_size), Image.Resampling.LANCZOS)
+                im.save(path)
+                previous = {'sha256': digest(path), 'size': list(im.size)}
+                proxies[source['id']] = previous
+            source.update(proxy_path=str(path), proxy_sha256=previous['sha256'], proxy_size=previous['size'],
+                          proxy_to_source=[source['size'][i] / previous['size'][i] for i in (0, 1)])
+        atomic_json(proxies_path, proxies)
+        plan = None
+        if not getattr(args, 'refresh_discovery', False):
+            try:
+                saved = json.loads((entry / 'plan.json').read_text(encoding='utf-8'))
+                if saved['profile'] == profile and json_digest(saved['plan']) == saved['plan_sha256']:
+                    plan = saved['plan']
+                    plan['sources'] = sources
+                    validate_plan(plan, output.parent)
+            except (OSError, ValueError, KeyError, TypeError):
+                plan = None
+        if plan is None:
+            plan = {'sources': sources, 'discovery': {'provider': 'codex-vision', 'status': 'awaiting_image_analysis'},
+                    'candidates': []}
+        plan.setdefault('discovery', {}).update(cache_hit=bool(plan['candidates']), intent=intent)
+        plan['discovery_cache'] = {'directory': str(entry), 'key': key, 'profile': profile}
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open('x', encoding='utf-8') as f:
-        json.dump({'sources': sources, 'discovery': {'provider': 'codex-vision', 'status': 'awaiting_image_analysis'},
-                   'candidates': []}, f, ensure_ascii=False, indent=2)
-    print(json.dumps({'inventory': str(output), 'sources': sources}, ensure_ascii=False))
+        json.dump(plan, f, ensure_ascii=False, indent=2)
+    print(json.dumps({'inventory': str(output), 'sources': sources, 'cache_hit': plan['discovery']['cache_hit'],
+                      'candidates': len(plan['candidates'])}, ensure_ascii=False))
+    return 0
+
+
+@hash_command
+def discovery_save(args):
+    inventory_path, plan_path = Path(args.inventory).resolve(), Path(args.plan).resolve()
+    inventory_data = json.loads(inventory_path.read_text(encoding='utf-8-sig'))
+    plan = json.loads(plan_path.read_text(encoding='utf-8-sig'))
+    cache = inventory_data['discovery_cache']
+    if json_digest(cache['profile']) != cache['key'] or cache['profile']['script_sha256'] != digest(__file__):
+        raise ValueError('Discovery cache profile changed; regenerate inventory')
+    current = {s['id']: s for s in inventory_data['sources']}
+    if ([{k: s[k] for k in ('id', 'sha256', 'size')} for s in current.values()] != cache['profile']['sources']
+            or cache['profile']['version'] != DISCOVERY_VERSION):
+        raise ValueError('Inventory no longer matches its discovery profile')
+    if {s['id'] for s in plan['sources']} != set(current):
+        raise ValueError('Discovery plan must use the inventoried sources')
+    for s in plan['sources']:
+        path = Path(s['path'])
+        path = (plan_path.parent / path).resolve() if not path.is_absolute() else path.resolve()
+        if path != Path(current[s['id']]['path']).resolve():
+            raise ValueError('Discovery plan refers to a different source path')
+    for s in current.values():
+        if digest(s['path']) != s['sha256'] or list(image_size(s['path'])) != s['size']:
+            raise ValueError('Discovery source changed')
+        if digest(s['proxy_path']) != s['proxy_sha256'] or list(image_size(s['proxy_path'])) != s['proxy_size']:
+            raise ValueError('Discovery proxy changed')
+    space = plan.pop('coordinate_space', 'source')
+    if space not in ('source', 'proxy'):
+        raise ValueError('coordinate_space must be source or proxy')
+    if space == 'proxy':
+        for a in plan['candidates']:
+            s = current[a['source_id']]
+            pw, ph = s['proxy_size']
+            box = a['bbox']
+            if (len(box) != 4 or any(type(v) is not int for v in box)
+                    or not (0 <= box[0] < box[2] <= pw and 0 <= box[1] < box[3] <= ph)):
+                raise ValueError('Proxy bbox outside discovery thumbnail')
+            sx, sy = (s['size'][i] / s['proxy_size'][i] for i in (0, 1))
+            a['bbox'] = [math.floor(box[0] * sx), math.floor(box[1] * sy),
+                         min(s['size'][0], math.ceil(box[2] * sx)), min(s['size'][1], math.ceil(box[3] * sy))]
+            for field in ('foreground_points', 'background_points'):
+                mapped = []
+                for x, y in a.get(field, []):
+                    if type(x) is not int or type(y) is not int or not (0 <= x < pw and 0 <= y < ph):
+                        raise ValueError('Proxy point outside thumbnail')
+                    mapped.append([min(s['size'][0] - 1, round(x * sx)), min(s['size'][1] - 1, round(y * sy))])
+                if field in a:
+                    a[field] = mapped
+    plan['sources'] = list(current.values())
+    if plan.get('discovery', {}).get('status') != 'complete':
+        raise ValueError('Only completed visual discovery may be cached')
+    validate_plan(plan, plan_path.parent)
+    output = Path(args.output).resolve()
+    if output.exists():
+        raise FileExistsError('Normalized plan already exists')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open('x', encoding='utf-8') as stream:
+        json.dump(plan, stream, ensure_ascii=False, indent=2)
+    entry = Path(cache['directory']).resolve()
+    with job_lock(entry):
+        atomic_json(entry / 'plan.json', {'profile': cache['profile'], 'plan': plan, 'plan_sha256': json_digest(plan)})
+    print(json.dumps({'plan': str(output), 'cache_saved': True, 'coordinate_space': 'source'}, ensure_ascii=False))
     return 0
 
 
@@ -772,6 +1101,7 @@ def repair_result(args):
     attempt.setdefault('received_at', datetime.now(timezone.utc).isoformat())
     a.update(generated_repair=True, provider='builtin-image-tool')
     a.pop('portrait_layout', None)
+    a.pop('batch_review', None)
     save_manifest(job, manifest)
     try:
         # Preserve native alpha; never re-matte a transparent generated result.
@@ -789,6 +1119,7 @@ def repair_result(args):
     output.save(job / 'review' / f'{aid}.png')
     preview(read_image(job / 'candidates' / f'{aid}.png'), output, job / 'previews' / f'{aid}.jpg')
     a.update(status='REVIEW', metrics=metrics, review_sha256=digest(job / 'review' / f'{aid}.png'))
+    a['preview_sha256'] = digest(job / 'previews' / f'{aid}.jpg')
     attempt['status'] = 'REVIEW'
     save_manifest(job, manifest)
     contact_sheet(job, manifest)
@@ -807,7 +1138,8 @@ def status(args):
                       'resume portrait-layout with recorded layout parameters' if a.get('pending_portrait') else
                       'view actual result, mark head polygon and upper-body crop, then portrait-layout' if
                       a.get('portrait') and not a.get('portrait_layout') else
-                      'view preview, then review accept/reject with observations')
+                      'view Contact Sheet and review-batch; send uncertain items to detail' if review_kind(a) == 'batch' else
+                      'view original and individual preview, then review accept/reject with observations')
         elif state == 'WAITING_REPAIR':
             action = ('view candidate, repair-start to reserve a slot, call image_gen once, repair-result with attempt'
                       if repair_capacity(manifest)['available_slots'] else 'wait for capacity; recover blocked requests')
@@ -825,6 +1157,9 @@ def status(args):
                         'error': a.get('error')})
     print(json.dumps({'job': str(job), 'counts': manifest['counts'],
                       'processing': manifest.get('processing', 'builtin-repair'),
+                      'batch_review_ids': [a['id'] for a in manifest['assets']
+                                           if a['status'] == 'REVIEW' and review_kind(a) == 'batch'],
+                      'review_sheet_command': 'review-sheet --job ' + str(job),
                       'capacity': repair_capacity(manifest), 'active_tasks': active_repairs(manifest),
                       'ready_to_finalize': not actions, 'actions': actions}, ensure_ascii=False, indent=2))
     return 0
@@ -869,6 +1204,7 @@ def finalize(args):
               'generated_pass': sum(a['status'] == 'PASS' and a['generated_repair'] for a in manifest['assets']),
               'assets': [{'id': a['id'], 'label': a['label'], 'status': a['status'],
                           'generated': a['generated_repair'],
+                          'review_mode': a.get('visual_review', {}).get('mode'), 'batch_review': a.get('batch_review'),
                           'portrait_layout': a.get('portrait_layout'),
                           'path': 'assets/' + a['id'] + '.png' if a['status'] == 'PASS' else 'manual/' + a['id'] + '.json',
                           'reason': a.get('manual_reason')} for a in manifest['assets']]}
@@ -888,7 +1224,7 @@ def verify(args):
         raise ValueError('Incomplete delivery index')
     for relative, expected in index.items():
         path = (job / relative).resolve()
-        if not path.is_relative_to(job) or not path.is_file() or digest(path) != expected:
+        if not path.is_relative_to(job) or not path.is_file() or digest(path, fresh=True) != expected:
             raise ValueError('Missing or changed artifact: ' + relative)
     print(json.dumps({'verified_files': len(index), 'job': str(job)}))
     return 0
@@ -974,7 +1310,25 @@ def main():
     p = sub.add_parser('inventory')
     p.add_argument('--input', nargs='+', required=True)
     p.add_argument('--output', required=True)
+    p.add_argument('--proxy-size', type=int, default=1024, help='Discovery thumbnail long edge (256..2048)')
+    p.add_argument('--intent', default='reusable-design-assets', help='Actual request; change when goals or constraints change')
+    p.add_argument('--cache-dir', default=None)
+    p.add_argument('--refresh-discovery', action='store_true')
     p.set_defaults(run=inventory)
+    p = sub.add_parser('discovery-save')
+    p.add_argument('--inventory', required=True)
+    p.add_argument('--plan', required=True)
+    p.add_argument('--output', required=True)
+    p.set_defaults(run=discovery_save)
+    p = sub.add_parser('review-sheet')
+    p.add_argument('--job', required=True)
+    p.add_argument('--batch-size', type=int, default=8)
+    p.set_defaults(run=review_sheet)
+    p = sub.add_parser('review-batch')
+    p.add_argument('--job', required=True)
+    p.add_argument('--sheet', required=True)
+    p.add_argument('--decisions', required=True)
+    p.set_defaults(run=review_batch)
     p = sub.add_parser('repair-queue')
     p.add_argument('--job', required=True)
     p.set_defaults(run=repair_queue)

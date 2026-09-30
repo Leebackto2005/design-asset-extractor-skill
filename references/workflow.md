@@ -7,7 +7,7 @@
 # 可显式提供 Python 3.12 路径：./scripts/bootstrap.ps1 -Python C:/Python312/python.exe
 ```
 
-脚本自动创建 `.venv`、安装固定版本、检查依赖并运行四套离线测试（self-test、test_workflow.py、test_parallel.py、test_portrait.py）；失败立即停止。后续以下命令中的 `python` 均替换为仓库下 `.venv/Scripts/python.exe`。非 Windows 环境用 Python 3.12 执行 `python -m venv .venv`、`.venv/bin/python -m pip install -r requirements.txt` 及这四套测试。固定的是库版本；任务还记录实际 Python/平台/脚本哈希，不承诺跨平台逐字节重算一致。
+脚本自动创建 `.venv`、安装固定版本、检查依赖并运行五套离线测试（self-test、test_workflow.py、test_parallel.py、test_portrait.py、test_efficiency.py）；失败立即停止。后续以下命令中的 `python` 均替换为仓库下 `.venv/Scripts/python.exe`。非 Windows 环境用 Python 3.12 执行 `python -m venv .venv`、`.venv/bin/python -m pip install -r requirements.txt` 及这五套测试。固定的是库版本；任务还记录实际 Python/平台/脚本哈希，不承诺跨平台逐字节重算一致。
 
 用户明确要求人像抠图或上半身构图时，按 [人像接口](portrait.md) 设置 portrait=true、选择提取/补全及执行 portrait-layout。人像可在 local-first 下进行必要的 B/extract 或 B/complete；已有透明人像支持 A/native-alpha。该例外不改变普通素材路由。
 
@@ -17,7 +17,7 @@
 python scripts/asset_job.py inventory --input 图片.png 或文件夹 --output 新目录/inventory.json
 ```
 
-支持多个图片/文件夹输入，文件夹仅扫描当前层。inventory 只枚举，不伪装成视觉发现；Codex 随后分配 source 原图的查看与发现任务，自动写新的 plan.json：
+支持多个图片/文件夹输入，文件夹仅扫描当前层。inventory 枚举、生成缩略图并检查 Discovery 缓存，不伪装成视觉识别；缓存未命中由 Codex 看缩略图与必要原图局部，写新的 plan.json。默认使用 [两级分辨率与缓存接口](efficiency.md)，发现完成后 discovery-save 再 build；已有源图坐标计划仍兼容直接 build。计划示例：
 
 ```json
 {
@@ -60,7 +60,7 @@ build 不调用内置工具。`--workers` 接受正整数，默认 5，新任务
 
 主 agent 在发现阶段按 source ID 分工。给每个 worker 独立的源图路径、实际尺寸、候选 ID 前缀及计划片段输出路径；worker 只写自己的片段。主 agent 合并为一个 plan.json，检查来源、重复候选及整体覆盖后统一 build。单张原图直接发现，不为这一项创建 subagent；该图发现出的多个独立素材仍可在后续并行处理。
 
-本地处理统一交给 build 的线程池。subagent 主要承担发现和复核；复核阶段按互斥素材 ID 分工，每个 worker 收到任务目录绝对路径、素材 ID、原裁切和实际预览路径。默认继承主 agent 的模型，一次分配只交给一个 worker，完成一项立即补充下一项。A 输出经 Alpha 检查后仍必须看原图、深浅底再审核，C 保留人工原因，主 agent 汇总并 finalize/verify。仅必要且已授权的生成式任务由 worker 完成查看裁切、登记、调用、导入及复核；同一素材保持顺序。
+本地处理统一交给 build 的线程池。subagent 主要承担发现和复核；A 快速通道按互斥 Contact Sheet 批次分工，其余按互斥素材 ID 分工，每个 worker 收到任务目录绝对路径、批次索引/素材 ID、原裁切和实际预览路径。默认继承主 agent 的模型，一次分配只交给一个 worker，完成一项立即补充下一项。A 输出经 Alpha 检查后仍必须看原图、深浅底再审核，可用 [review-sheet/review-batch](efficiency.md) 批量复核，存疑项 detail 后单独细看；C 保留人工原因，主 agent 汇总并 finalize/verify。仅必要且已授权的生成式任务由 worker 完成查看裁切、登记、调用、导入及复核；同一素材保持顺序。
 
 本地线程池按候选数量和 workers 上限调度，不受 agent 名额直接限制；配置 5 时可并行提取 5 项。发现和复核按独立任务数及宿主实际 agent 名额调度。生成式补全另受图片工具并发限制，不能为了凑足并行数量把本地候选送去生成。宿主没有 subagent 时由主 agent 发现和复核，脚本仍按配置批量处理；保留限制与实际耗时说明。
 

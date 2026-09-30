@@ -109,7 +109,7 @@ def thread_checks(root):
         active = maximum = entered = 0
         original = j.build_candidate
 
-        def overlapping(job, candidate):
+        def overlapping(job, candidate, source_images=None):
             nonlocal active, maximum, entered
             with mutex:
                 ticket = entered
@@ -120,7 +120,7 @@ def thread_checks(root):
                 if ticket < effective:
                     barrier.wait()
                 time.sleep(.02)
-                return original(job, candidate)
+                return original(job, candidate, source_images)
             finally:
                 with mutex:
                     active -= 1

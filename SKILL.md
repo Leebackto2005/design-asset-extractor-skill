@@ -3,7 +3,7 @@ name: design-asset-extractor
 description: 大模型识别设计素材或人像，脚本批量并行提取、构图与复核后交付透明 PNG；普通素材默认本地提取，明确的人像抠图和身体补全可调用内置图片工具。适用于 AI 大图拆分、遮挡补全、上半身人像构图及批量素材整理。
 ---
 
-# Automatic Discovery + Parallel Local Extraction + Optional Completion
+# Cached Discovery + Parallel Local Extraction + Batch Review
 
 用户提供图片或文件夹即可启动。默认由 Codex 看图、发现候选并写提取参数，Python 脚本批量分离原像素、生成 Alpha、预览和 PNG，Codex 再复核；不要要求用户填写 bbox、JSON、蒙版或逐张复制提示词。以可用率优先，保留花叶、点阵等可复用组合；重叠图形分为「组合素材」与「拆解素材」：先保留可见组合，完整且能干净分离的图形再作为拆解素材单独交付。
 
@@ -35,7 +35,13 @@ https://github.com/Leebackto2005/design-asset-extractor-skill
 
 首次使用按 [执行接口](references/workflow.md) 创建项目独立环境并运行测试，后续使用该环境的 Python。自动执行依赖准备、inventory、看图写计划、build、状态循环及 finalize/verify；用户只需提供源图片，不要求逐项批准计划或填写技术字段。网络或工具权限按宿主要求处理。
 
-每轮运行 `status --job`：REVIEW 人像先构图或恢复 pending_portrait，其余查看原图与深浅底预览后审核；若有 pending_review，用其中记录的 decision 和 note 恢复审核；WAITING_REPAIR 仅处理用户已要求的补全、人像或已选的生成式路线，按可用名额分发；REPAIRING/REPAIR_BLOCKED 只查找原调用结果并恢复；ERROR 检查本地错误并修复，不能解决则报告具体障碍。全部 PASS/MANUAL 后 finalize、verify，再交付素材及人工清单。有未解决状态时只报告部分结果，不宣布完成。两次生成式处理失败会自动生成完整人工任务包，不要求用户搬运文件。
+每轮运行 `status --job`：REVIEW 人像先构图或恢复 pending_portrait；普通 A 的 batch_review_ids 使用下节快速通道，其余查看原图与深浅底预览后单独审核；若有 pending_review，用其中记录的 decision 和 note 恢复审核，也可重放原批次决定；WAITING_REPAIR 仅处理用户已要求的补全、人像或已选的生成式路线，按可用名额分发；REPAIRING/REPAIR_BLOCKED 只查找原调用结果并恢复；ERROR 检查本地错误并修复，不能解决则报告具体障碍。全部 PASS/MANUAL 后 finalize、verify，再交付素材及人工清单。有未解决状态时只报告部分结果，不宣布完成。两次生成式处理失败会自动生成完整人工任务包，不要求用户搬运文件。
+
+### A 路线快速通道
+
+按 [效率接口](references/efficiency.md) 执行：通过自动 Alpha/边界 QC 的普通 A/matte、A/crop 候选默认进入 Contact Sheet 批量视觉复核。运行 review-sheet，查看其返回的每张实际图片，逐行对照原裁切、浅底、深底，再写各 ID 的 accept/reject/detail 与实际观察。review-batch 一次提交完整批次，不能在未看图时填统一通过理由，不允许 QC 后自动 PASS 或只抽查部分素材。detail 保持 REVIEW，放大对应素材再用 review 单独审核。人像、生成式素材、bright-background、小主体、明确存疑或旧任务缺预览哈希的素材仍逐项细看。crop 是照片卡片，仅外围透明。
+
+默认一页最多 8 个，可设 1..12；使用返回的批次 ID 分工，不能把同一素材同时交给批量与单项 worker。局部细节无法辨认时升级 detail，不能为省调用而忽略残留、细边或裁断。批次索引绑定候选、审核图、预览及拼版 SHA-256；改图后旧决定无效。保留原任务锁、最多两次生成、Alpha 检查和 finalize/verify。Hash 只在同一命令内对未改变的文件复用，verify 独立重读交付文件。
 
 ### 自适应并发与 subagent
 
@@ -49,7 +55,9 @@ https://github.com/Leebackto2005/design-asset-extractor-skill
 
 ## 1. Automatic Candidate Discovery
 
-运行 inventory 获取图片路径、实际尺寸和源文件哈希，详见 [references/workflow.md](references/workflow.md)。按原图分工，每个负责的 agent 用 view_image 看自己的原图，需要时看局部；主 agent 合并计划并检查重复、来源关联与整体覆盖。
+运行 inventory 获取图片路径、实际尺寸、源文件哈希及默认最长边 1024 的 Discovery 缩略图，--intent 必须描述当前目标和约束。详见 [效率接口](references/efficiency.md)。缓存未命中时先看 proxy_path 发现完整主体，细小文字、边缘、交叠和低把握定位再看原图局部；主 agent 合并计划并检查重复、来源关联与整体覆盖。缩略图坐标计划声明 coordinate_space=proxy，由 discovery-save 转回原图坐标；已有原图坐标可用 source。完成视觉发现后运行 discovery-save 保存规范计划与缓存，再 build。
+
+cache_hit=true 时可复用候选参数；先核对当前目标、约束和整体覆盖，不重复逐区识别。缓存仅复用发现计划，不复用旧 PASS 或跳过新输出 QC/视觉复核。改变任务意图时更改 --intent，要求重做发现时用 --refresh-discovery；源图内容、缩略图尺寸或脚本版本变化会失效。完整输出始终从原图提取，不把缩略图或低分辨率蒙版放大成最终素材。build 在 256 MiB 解码预算内共享每张原图的一次解码，超出预算会回退磁盘读取。
 
 自动寻找对设计有价值的完整主体和组合，输出唯一 ID、标签、bbox、route、reason。对可本地提取者写 A/AUTO，选择 `matte`、`crop` 或 `bright-background`；matte 提供实际采样 `background_rgb`，需要时加源图坐标的 foreground_points/background_points。不能把缺少提取参数的对象写为 B/extract 并假定脚本会语义抠图。背景纹理或连续水面可列为 C，不逐滴收集散落水珠。对整图做覆盖复查，记录 discovery 的 provider=codex-vision、coverage_notes、excluded，不能把主观把握写成统计置信度。
 
