@@ -1,13 +1,23 @@
 ---
 name: design-asset-extractor
-description: 大模型识别可复用设计素材并提供提取参数，Python 脚本批量并行生成透明 PNG；按任务数量分发 subagent 发现与复核，默认仅在明确要求遮挡补全时使用内置图片工具。适用于素材拼版、AI 大图拆分、遮挡补全、批量素材整理。
+description: 大模型识别设计素材或人像，脚本批量并行提取、构图与复核后交付透明 PNG；普通素材默认本地提取，明确的人像抠图和身体补全可调用内置图片工具。适用于 AI 大图拆分、遮挡补全、上半身人像构图及批量素材整理。
 ---
 
 # Automatic Discovery + Parallel Local Extraction + Optional Completion
 
 用户提供图片或文件夹即可启动。默认由 Codex 看图、发现候选并写提取参数，Python 脚本批量分离原像素、生成 Alpha、预览和 PNG，Codex 再复核；不要要求用户填写 bbox、JSON、蒙版或逐张复制提示词。以可用率优先，保留花叶、点阵等可复用组合；重叠图形分为「组合素材」与「拆解素材」：先保留可见组合，完整且能干净分离的图形再作为拆解素材单独交付。
 
-新任务默认 `--processing local-first`，普通提取失败转人工，不逐个素材调用图片模型。仅用户明确要求遮挡补全时建 B/complete；明确选择生成式分离或修补时才使用 `--processing builtin-repair`，保留历史内置工具路线。生成式任务使用当前会话 `image_gen`，无需 API Key 或网页操作；工具未披露模型时 manifest 的 model 为 null，不能声称锁定 Images 2.5。单独运行 Python 不进行视觉识别。
+新任务默认 `--processing local-first`，普通素材提取失败转人工，不逐个素材调用图片模型。用户明确要求遮挡补全时建 B/complete；明确的人像请求按下节执行，允许必要的分离与身体补全。明确选择一般生成式分离或修补时使用 `--processing builtin-repair`，保留历史内置工具路线。生成式任务使用当前会话 `image_gen`，无需 API Key 或网页操作；工具未披露模型时 manifest 的 model 为 null，不能声称锁定 Images 2.5。单独运行 Python 不进行视觉识别。
+
+## 人像抠图与上半身构图
+
+用户明确要求“抠人像”“补齐肩膀”或“上半身证件照构图”时，读取 [人像工作流](references/portrait.md)。不能仅因图片中出现人物就启用此模式。
+
+候选设置 `portrait=true`；已有透明人像用 A/native-alpha 保留原 Alpha，适合本地方法者先提取。复杂背景或发丝难以干净分离时用 B/extract，缺少身体时用 B/complete 一次分离并补全；不新增模型下载。此例外不改变普通素材的脚本优先规则，repair_allowed=false 仍禁止生成。保持人物身份、五官、发型、表情、原姿态和可见服装，不主动换装、美颜或改脸；所有生成式处理必须标注并对照原图复核。
+
+默认输出 3:4 透明 PNG，头部实际轮廓的 Alpha 加权面积约占画布 40%，允许 ±3 个百分点，60%仅作可选中间参考。头部含发型、脸和耳朵，止于下巴，不计垂到肩部的长发。优先完整头部、双肩及胸部上段，必要时降低占比并说明实际值；不拉伸人物，不为比例反复生成。
+
+每次实际回图后重新标定头部多边形与上半身区域，参数绑定回图 SHA-256，执行 portrait-layout 后查看头部蒙版、原图及深浅底，再审核。胸部可在底边自然截断，但不能裁掉头发或双肩。尚未构图或存在待恢复构图时不能接受、交付；两次生成请求、并发和结果恢复继续使用共享机制。不要把合成轮廓测试当作真实人像效果证明。
 
 ## 0. 自动执行与复现
 
@@ -25,7 +35,7 @@ https://github.com/Leebackto2005/design-asset-extractor-skill
 
 首次使用按 [执行接口](references/workflow.md) 创建项目独立环境并运行测试，后续使用该环境的 Python。自动执行依赖准备、inventory、看图写计划、build、状态循环及 finalize/verify；用户只需提供源图片，不要求逐项批准计划或填写技术字段。网络或工具权限按宿主要求处理。
 
-每轮运行 `status --job`：REVIEW 查看原图与深浅底预览后审核；若有 pending_review，用其中记录的 decision 和 note 恢复审核；WAITING_REPAIR 仅处理用户已要求的补全或已选的生成式路线，按可用名额分发；REPAIRING/REPAIR_BLOCKED 只查找原调用结果并恢复；ERROR 检查本地错误并修复，不能解决则报告具体障碍。全部 PASS/MANUAL 后 finalize、verify，再交付素材及人工清单。有未解决状态时只报告部分结果，不宣布完成。两次生成式处理失败会自动生成完整人工任务包，不要求用户搬运文件。
+每轮运行 `status --job`：REVIEW 人像先构图或恢复 pending_portrait，其余查看原图与深浅底预览后审核；若有 pending_review，用其中记录的 decision 和 note 恢复审核；WAITING_REPAIR 仅处理用户已要求的补全、人像或已选的生成式路线，按可用名额分发；REPAIRING/REPAIR_BLOCKED 只查找原调用结果并恢复；ERROR 检查本地错误并修复，不能解决则报告具体障碍。全部 PASS/MANUAL 后 finalize、verify，再交付素材及人工清单。有未解决状态时只报告部分结果，不宣布完成。两次生成式处理失败会自动生成完整人工任务包，不要求用户搬运文件。
 
 ### 自适应并发与 subagent
 
@@ -64,14 +74,14 @@ bbox 为实际源图像素，留边并保留辨识上下文。计划是 Codex �
 | 路线 | 判断 | 处理 |
 |---|---|---|
 | A / AUTO | 适合 matte、crop 或 bright-background，并已提供本地参数 | 默认由脚本提取，失败进 C；用户明确选 builtin-repair 时普通失败可进 B，bright-background 失败仍进 C |
-| B / IMAGE2 | 用户明确要求的遮挡补全，或已选生成式分离/修补 | local-first 仅 complete 可调用内置工具；普通 B/extract 无本地指导转 C，不能靠图片生成补足提取参数 |
+| B / IMAGE2 | 用户明确要求的遮挡补全、人像处理，或已选生成式分离/修补 | local-first 允许 complete 与明确人像任务；普通 B/extract 无本地指导转 C，不能靠图片生成补足提取参数 |
 | C / MANUAL | 重度缺失、复杂透明/反射、文字或产品结构要求像素准确且不能保证 | 保存任务图和原因；不默认重绘 |
 
-是否完整与本地能否可靠分离分别判断：渐变天空上的主体不能只凭“完整”认定可自动提取，当前方法不适用时进 C。被遮挡的扇贝优先保留与遮挡物的组合；用户明确要求独立补全时另建 B/complete。气泡、透明水流、完整场景背景可进 C。local-first 对非 complete 候选统一禁用生成式回退；严格原像素要求设置 repair_allowed=false，也禁止补全。
+是否完整与本地能否可靠分离分别判断：渐变天空上的主体不能只凭“完整”认定可自动提取，当前方法不适用时进 C。被遮挡的扇贝优先保留与遮挡物的组合；用户明确要求独立补全时另建 B/complete。气泡、透明水流、完整场景背景可进 C。local-first 对普通非 complete 候选禁用生成式回退，人像按独立工作流执行；严格原像素要求设置 repair_allowed=false，也禁止补全。
 
 ## 3. Built-in Image Repair
 
-仅用于用户明确要求的 B/complete，或已明确选择 builtin-repair 的任务。build 生成任务后，按 repair-queue 的可用名额分发独立候选；普通本地提取与复核不进入此流程。每个生成式候选内部按以下顺序执行：
+仅用于用户明确要求的 B/complete、人像分离/补全，或已明确选择 builtin-repair 的任务。build 生成任务后，按 repair-queue 的可用名额分发独立候选；普通本地提取与复核不进入此流程。每个生成式候选内部按以下顺序执行：
 
 1. 查看队列指定的裁切图；如果边缘已裁掉主体，先修正计划重建任务，不让生成工具掩盖定位错误。
 2. 运行 repair-start，成功占用名额后读取输出的 id、attempt、prompt 和参考图路径，调用一次内置 image_gen。使用 `referenced_image_paths` 明确引用该候选裁切；禁止用最近图片或返回顺序关联素材。一个候选一张图，不把整批素材生成到同一拼版。

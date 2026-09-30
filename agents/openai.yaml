@@ -1,4 +1,4 @@
 interface:
   display_name: "设计素材拆分"
-  short_description: "大模型识别素材，脚本批量并行提取与复核；仅按明确需求生成式补全，交付透明 PNG"
+  short_description: "识别素材与人像，批量提取、上半身构图并复核，按明确需求补全，交付透明 PNG"
   default_prompt: "使用 $design-asset-extractor 识别这些图片中的素材并提供提取参数，用脚本批量并行处理、复核并交付透明 PNG，仅在明确要求遮挡补全时调用内置图片工具。"

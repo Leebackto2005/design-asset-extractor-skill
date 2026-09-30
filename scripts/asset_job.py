@@ -7,6 +7,7 @@ import re
 import tempfile
 import shutil
 import platform
+import math
 import errno
 import time
 from contextlib import contextmanager
@@ -189,12 +190,13 @@ def matte(im, background, points=(), foreground_points=(), tolerance=36):
     return Image.fromarray(rgba)
 
 
-def inspect(im):
+def inspect(im, allow_bottom=False):
     alpha = np.asarray(im.getchannel('A'))
     foreground = alpha > 8
     if not foreground.any() or not (alpha == 0).any():
         raise ValueError('Empty foreground or no fully transparent background')
-    if (alpha[0] > 8).any() or (alpha[-1] > 8).any() or (alpha[:, 0] > 8).any() or (alpha[:, -1] > 8).any():
+    if ((alpha[0] > 8).any() or (not allow_bottom and (alpha[-1] > 8).any())
+            or (alpha[:, 0] > 8).any() or (alpha[:, -1] > 8).any()):
         raise ValueError('Foreground touches crop edge: expand crop or route to manual')
     ys, xs = np.where(foreground)
     return {'width': im.width, 'height': im.height,
@@ -264,23 +266,166 @@ def preview(source, output, target):
 
 def process(job, asset, im, background=None, points=(), foreground_points=()):
     method = asset.get('extraction_method', 'matte')
-    output = (matte(im, background, points, foreground_points, asset.get('background_tolerance', 36)) if method == 'matte'
+    output = (im.copy() if method == 'native-alpha' else
+              matte(im, background, points, foreground_points, asset.get('background_tolerance', 36)) if method == 'matte'
               else local_extract(im, method, asset.get('padding', 12)))
     # Check the actual crop before adding transparent padding. Padding cannot
     # prove that background removal succeeded or that the target is complete.
-    inspect(output)
+    inspect(output, allow_bottom=bool(asset.get('portrait') and method == 'native-alpha'))
     if method == 'matte':
         padding = asset.get('padding', 12)
         if type(padding) is not int or not 0 <= padding <= 512:
             raise ValueError('padding must be an integer in 0..512 for matte')
         if padding:
             output = ImageOps.expand(output, border=padding, fill=(0, 0, 0, 0))
-    metrics = inspect(output)
+    metrics = inspect(output, allow_bottom=bool(asset.get('portrait') and method == 'native-alpha'))
     aid = asset['id']
     output.getchannel('A').save(job / 'masks' / f'{aid}.png')
     output.save(job / 'review' / f'{aid}.png')
     preview(im, output, job / 'previews' / f'{aid}.jpg')
     asset.update(status='REVIEW', metrics=metrics, review_sha256=digest(job / 'review' / f'{aid}.png'))
+
+
+def compose_portrait(im, layout):
+    """Keep native pixels; change canvas and crop only the selected lower torso."""
+    if not isinstance(layout, dict):
+        raise ValueError('Portrait layout must be a JSON object')
+    alpha = np.asarray(im.getchannel('A'))
+    inspect(im, allow_bottom=True)
+    polygon = layout.get('head_polygon', [])
+    if (not isinstance(polygon, list) or len(polygon) < 3
+            or any(not isinstance(p, list) or len(p) != 2 or any(type(v) is not int for v in p)
+                   or not (0 <= p[0] < im.width and 0 <= p[1] < im.height) for p in polygon)):
+        raise ValueError('head_polygon needs at least three integer points inside the input')
+    box = layout.get('upper_body_bbox')
+    if (not isinstance(box, list) or len(box) != 4 or any(type(v) is not int for v in box)
+            or not (0 <= box[0] < box[2] <= im.width and 0 <= box[1] < box[3] <= im.height)):
+        raise ValueError('upper_body_bbox needs four valid input coordinates')
+    x0, y0, x1, y1 = box
+    if any(not (x0 <= x < x1 and y0 <= y < y1) for x, y in polygon):
+        raise ValueError('Upper-body crop must contain the entire head polygon')
+    if ((alpha[:y0] > 8).any() or (alpha[:y1, :x0] > 8).any() or (alpha[:y1, x1:] > 8).any()):
+        raise ValueError('Upper-body crop may trim the bottom only, not head or shoulders')
+    target = layout.get('target_head_area_ratio', 0.4)
+    if type(target) not in (int, float) or not math.isfinite(target) or not 0 < target < 1:
+        raise ValueError('target_head_area_ratio must be a finite number between zero and one')
+    aspect = layout.get('aspect_ratio', [3, 4])
+    if (not isinstance(aspect, list) or len(aspect) != 2
+            or any(type(v) is not int or not 1 <= v <= 100 for v in aspect)):
+        raise ValueError('aspect_ratio needs two positive integers in 1..100')
+    divisor = math.gcd(*aspect)
+    aw, ah = (v // divisor for v in aspect)
+    region = Image.new('L', im.size)
+    ImageDraw.Draw(region).polygon([tuple(p) for p in polygon], fill=255)
+    head = Image.fromarray(np.where(np.asarray(region) > 0, alpha, 0).astype(np.uint8)).crop(box)
+    head_area = float(np.asarray(head, dtype=np.float64).sum() / 255)
+    if head_area <= 0:
+        raise ValueError('Head polygon has no visible Alpha coverage')
+    body = im.crop(box)
+    bounds, head_bounds = body.getchannel('A').getbbox(), head.getbbox()
+    bx0, by0, bx1, by1 = bounds
+    hx0, _, hx1, _ = head_bounds
+    center = (hx0 + hx1) / 2
+    target_k = max(1, math.ceil(math.sqrt(head_area / (aw * ah * target))))
+    k = max(target_k, math.ceil((by1 - by0) / (ah * 0.95)),
+            math.ceil(max(center - bx0, bx1 - center) / (aw * 0.47)))
+    while True:
+        width, height = aw * k, ah * k
+        dx, dy = round(width / 2 - center), math.ceil(height * 0.05) - by0
+        if (dx + bx0 >= math.ceil(width * 0.03) and width - (dx + bx1) >= math.ceil(width * 0.03)
+                and dy + by1 <= height):
+            break
+        k += 1
+    if width > 8192 or height > 8192 or width * height > 64_000_000:
+        raise ValueError('Portrait canvas exceeds local memory limit; use a smaller input')
+    output = Image.new('RGBA', (width, height))
+    output.paste(body, (dx, dy))  # No Alpha mask: preserve RGBA, including soft edges.
+    mask = Image.new('L', output.size)
+    mask.paste(head, (dx, dy))
+    actual = float(np.asarray(mask, dtype=np.float64).sum() / 255 / (width * height))
+    metadata = {'target_head_area_ratio': target, 'actual_head_area_ratio': actual,
+                'head_area_pixels': head_area, 'area_estimate': 'vision-polygon-intersected-with-alpha',
+                'aspect_ratio': [aw, ah], 'canvas_size': [width, height], 'translation': [dx, dy],
+                'upper_body_bbox': box, 'within_tolerance': abs(actual - target) <= 0.03,
+                'adjustment_reason': 'Canvas enlarged to preserve upper body and margins' if k > target_k else None,
+                'allow_bottom_crop': True, 'upscaled': False}
+    return output, mask, metadata
+
+
+@locked_job
+def portrait_layout(args):
+    job, manifest = load_job(args.job)
+    a = next(a for a in manifest['assets'] if a['id'] == args.id)
+    if not a.get('portrait') or a['status'] != 'REVIEW' or a.get('pending_review'):
+        raise ValueError('Portrait layout requires an unreviewed portrait without pending review')
+    config_path = Path(args.layout).resolve()
+    config_sha = digest(config_path)
+    pending = a.get('pending_portrait')
+    if pending and pending['layout_sha256'] != config_sha:
+        raise ValueError('Resume the recorded portrait layout before changing parameters')
+    previous = pending or a.get('portrait_layout')
+    review_path = job / 'review' / f"{a['id']}.png"
+    input_path = job / previous['input_path'] if previous else review_path
+    input_sha = previous['input_sha256'] if previous else a['review_sha256']
+    if digest(input_path) != input_sha:
+        raise ValueError('Portrait input changed')
+    if not pending and digest(review_path) != a['review_sha256']:
+        raise ValueError('Portrait review file changed')
+    config = json.loads(config_path.read_text(encoding='utf-8-sig'))
+    if not isinstance(config, dict) or config.get('input_sha256') != input_sha:
+        raise ValueError('Layout input_sha256 must match the actual pre-layout portrait')
+    source = read_image(input_path)
+    output, head, record = compose_portrait(source, config)
+    folder = job / 'portraits' / a['id'] / (input_sha[:16] + '-' + config_sha[:16])
+    folder.mkdir(parents=True, exist_ok=True)
+    saved_input, saved_config = folder / 'input.png', folder / 'layout.json'
+    if not saved_input.exists():
+        shutil.copyfile(input_path, saved_input)
+    if not saved_config.exists():
+        shutil.copyfile(config_path, saved_config)
+    if digest(saved_input) != input_sha or digest(saved_config) != config_sha:
+        raise ValueError('Saved portrait input or layout changed')
+    head_path = folder / 'head-mask.png'
+    head.save(head_path)
+    overlay = Image.new('RGBA', output.size, (255, 60, 60, 0))
+    overlay.putalpha(head.point(lambda v: round(v * 0.35)))
+    Image.alpha_composite(output, overlay).save(folder / 'head-preview.png')
+    record.update(input_path=str(saved_input.relative_to(job)), input_sha256=input_sha,
+                  layout_path=str(saved_config.relative_to(job)), layout_sha256=config_sha,
+                  head_mask_path=str(head_path.relative_to(job)), head_mask_sha256=digest(head_path),
+                  head_preview_path=str((folder / 'head-preview.png').relative_to(job)),
+                  generated=bool(a['generated_repair']))
+    a['pending_portrait'] = record
+    save_manifest(job, manifest)
+    output.save(review_path)
+    output.getchannel('A').save(job / 'masks' / f"{a['id']}.png")
+    preview(read_image(job / 'candidates' / f"{a['id']}.png"), output, job / 'previews' / f"{a['id']}.jpg")
+    a.update(portrait_layout=record, metrics=inspect(output, allow_bottom=True), review_sha256=digest(review_path))
+    a.pop('pending_portrait', None)
+    contact_sheet(job, manifest)
+    save_manifest(job, manifest)
+    print(json.dumps({'id': a['id'], 'portrait_layout': record}, ensure_ascii=False))
+    return 0
+
+
+def inspect_asset(job, asset, im):
+    portrait = bool(asset.get('portrait'))
+    record = asset.get('portrait_layout')
+    if portrait:
+        if not record or asset.get('pending_portrait'):
+            raise ValueError('Run or resume portrait-layout before accepting this portrait')
+        for field in ('input', 'layout', 'head_mask'):
+            if digest(job / record[field + '_path']) != record[field + '_sha256']:
+                raise ValueError('Portrait evidence changed: ' + field)
+        with Image.open(job / record['head_mask_path']) as saved_mask:
+            head = np.asarray(saved_mask.convert('L'))
+            if saved_mask.size != im.size or (head > np.asarray(im.getchannel('A'))).any():
+                raise ValueError('Head mask does not match portrait Alpha')
+        ratio = float(head.astype(np.float64).sum() / 255 / (im.width * im.height))
+        aw, ah = record['aspect_ratio']
+        if im.width * ah != im.height * aw or abs(ratio - record['actual_head_area_ratio']) > 1e-10:
+            raise ValueError('Portrait area ratio or aspect changed')
+    return inspect(im, allow_bottom=portrait and bool(record))
 
 
 def contact_sheet(job, manifest):
@@ -314,6 +459,8 @@ def validate_plan(plan, base):
         ids.add(aid)
         if a['route'] not in ('AUTO', 'IMAGE2', 'MANUAL') or not a.get('reason') or not a.get('label'):
             raise ValueError('Missing label/reason or invalid route')
+        if 'portrait' in a and type(a['portrait']) is not bool:
+            raise ValueError('portrait must be a boolean for explicitly requested portrait mode')
         _, size = sources[a['source_id']]
         box = a['bbox']
         if len(box) != 4 or any(type(x) is not int for x in box):
@@ -323,10 +470,12 @@ def validate_plan(plan, base):
             raise ValueError('bbox outside image')
         if a['route'] == 'AUTO':
             method = a.get('extraction_method', 'matte')
-            if method not in ('matte', 'crop', 'bright-background'):
+            if method not in ('matte', 'crop', 'bright-background', 'native-alpha'):
                 raise ValueError('Unknown extraction_method')
+            if method == 'native-alpha' and not a.get('portrait'):
+                raise ValueError('native-alpha is reserved for portrait mode')
             padding = a.get('padding', 12)
-            if type(padding) is not int or not (0 if method == 'matte' else 1) <= padding <= 512:
+            if type(padding) is not int or not (0 if method in ('matte', 'native-alpha') else 1) <= padding <= 512:
                 raise ValueError('Invalid padding for extraction_method')
             if method == 'matte':
                 color(a['background_rgb'])
@@ -370,9 +519,10 @@ def build_candidate(job, candidate):
     except Exception as exc:
         a.update(status='ERROR', error=str(exc))
         if (isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True)
-                and a.get('extraction_method') != 'bright-background'
+                and (a.get('portrait') or a.get('extraction_method') != 'bright-background')
                 and (job / 'candidates' / f"{a['id']}.png").exists()):
-            a.update(route='IMAGE2', status='WAITING_REPAIR', repair_mode='extract',
+            a.update(route='IMAGE2', status='WAITING_REPAIR',
+                     repair_mode=a.get('repair_mode', 'extract') if a.get('portrait') else 'extract',
                      routing_history=[{'from': 'AUTO', 'to': 'IMAGE2', 'reason': str(exc)}])
         elif isinstance(exc, ValueError) and a['route'] == 'AUTO' and (job / 'candidates' / f"{a['id']}.png").exists():
             manual(job, a, 'Local extraction failed; no generative fallback: ' + str(exc))
@@ -391,7 +541,8 @@ def build(args):
     sources = validate_plan(plan, plan_path.parent)
     for a in plan['candidates']:
         a['initial_route'] = a['route']
-        if processing == 'local-first' and not (a['route'] == 'IMAGE2' and a.get('repair_mode') == 'complete'):
+        if processing == 'local-first' and not (a.get('portrait') or
+                (a['route'] == 'IMAGE2' and a.get('repair_mode') == 'complete')):
             a['repair_allowed'] = False
             if a['route'] == 'IMAGE2':
                 reason = 'Local extraction guidance unavailable; generative extraction disabled in local-first'
@@ -435,6 +586,8 @@ def review(args):
     for aid in dict.fromkeys(args.id):
         identifier(aid)
         a = next(a for a in manifest['assets'] if a['id'] == aid)
+        if a.get('pending_portrait'):
+            raise ValueError('Resume portrait-layout before reviewing')
         path = job / 'review' / f'{aid}.png'
         rejected_name = f"{aid}-attempt-{len(a.get('repair_attempts', []))}.png"
         dest = job / 'assets' / path.name if args.decision == 'accept' else job / 'rejected' / rejected_name
@@ -446,7 +599,10 @@ def review(args):
             raise ValueError('Missing review file without a recorded decision')
         if digest(checked) != a['review_sha256']:
             raise ValueError('Review stale or asset not awaiting review')
-        inspect(read_image(checked))
+        if args.decision == 'accept':
+            inspect_asset(job, a, read_image(checked))
+        else:
+            inspect(read_image(checked), allow_bottom=bool(a.get('portrait')))
         if path.exists() and dest.exists():
             raise ValueError('Destination already exists')
         selected.append((a, path, dest, pending))
@@ -461,7 +617,7 @@ def review(args):
                  visual_review={'decision': args.decision, 'note': args.note},
                  output_path=str(dest.relative_to(job)), output_sha256=digest(dest))
         if (args.decision == 'reject' and a.get('repair_allowed', True)
-                and a.get('extraction_method') != 'bright-background'
+                and (a.get('portrait') or a.get('extraction_method') != 'bright-background')
                 and (a.get('repair_attempts') or a['route'] == 'AUTO')):
             a.update(route='IMAGE2', status='WAITING_REPAIR' if len(a.get('repair_attempts', [])) < 2 else 'MANUAL',
                      repair_feedback=args.note)
@@ -531,7 +687,12 @@ def repair_prompt(asset):
     constraint = ('允许补全被遮挡或缺失的部分，保持可见结构、颜色、风格和透视。'
                   if asset.get('repair_mode') == 'complete' else
                   '目标本身完整：只去背景、分离主体，保持可见轮廓、纹理、配色、朝向，不补画或重新设计主体。')
-    return (request + '\n' + constraint +
+    portrait = ('\n人像模式：保持本人身份、五官、发型、表情、原姿态及可见服装，'
+                '不美颜、不换装、不将侧脸改成正脸。仅补明确缺失的肩部和胸部上段。'
+                '完整保留头发、双肩和上半身，输出真实透明人像。'
+                '60%仅为可选参考，不需生成中间版；最终头部面积约40%由后续脚本构图。'
+                if asset.get('portrait') else '')
+    return (request + '\n' + constraint + portrait +
             '\n输出单个可复用组合，四周留出至少 5% 空白边距，使用真正的透明 Alpha 背景。'
             '不要画棋盘格、底板、文字或水印。保留主体内部高光，空隙应透明。' +
             ('\n上次未通过原因：' + asset['repair_feedback'] if asset.get('repair_feedback') else ''))
@@ -610,6 +771,7 @@ def repair_result(args):
                    model=args.model, tool_reference=args.tool_reference)
     attempt.setdefault('received_at', datetime.now(timezone.utc).isoformat())
     a.update(generated_repair=True, provider='builtin-image-tool')
+    a.pop('portrait_layout', None)
     save_manifest(job, manifest)
     try:
         # Preserve native alpha; never re-matte a transparent generated result.
@@ -642,6 +804,9 @@ def status(args):
         state = a['status']
         if state == 'REVIEW':
             action = ('resume review with recorded decision and note' if a.get('pending_review') else
+                      'resume portrait-layout with recorded layout parameters' if a.get('pending_portrait') else
+                      'view actual result, mark head polygon and upper-body crop, then portrait-layout' if
+                      a.get('portrait') and not a.get('portrait_layout') else
                       'view preview, then review accept/reject with observations')
         elif state == 'WAITING_REPAIR':
             action = ('view candidate, repair-start to reserve a slot, call image_gen once, repair-result with attempt'
@@ -656,6 +821,7 @@ def status(args):
                         'candidate': str(job / 'candidates' / f"{a['id']}.png"),
                          'preview': str(job / 'previews' / f"{a['id']}.jpg"),
                         'pending_review': a.get('pending_review'),
+                        'pending_portrait': a.get('pending_portrait'), 'portrait_layout': a.get('portrait_layout'),
                         'error': a.get('error')})
     print(json.dumps({'job': str(job), 'counts': manifest['counts'],
                       'processing': manifest.get('processing', 'builtin-repair'),
@@ -686,7 +852,7 @@ def finalize(args):
             path = job / 'assets' / f"{a['id']}.png"
             if digest(path) != a['output_sha256']:
                 raise ValueError('Delivered asset changed: ' + a['id'])
-            inspect(read_image(path))
+            inspect_asset(job, a, read_image(path))
         else:
             for suffix in ('png', 'md', 'json'):
                 if not (job / 'manual' / f"{a['id']}.{suffix}").is_file():
@@ -703,6 +869,7 @@ def finalize(args):
               'generated_pass': sum(a['status'] == 'PASS' and a['generated_repair'] for a in manifest['assets']),
               'assets': [{'id': a['id'], 'label': a['label'], 'status': a['status'],
                           'generated': a['generated_repair'],
+                          'portrait_layout': a.get('portrait_layout'),
                           'path': 'assets/' + a['id'] + '.png' if a['status'] == 'PASS' else 'manual/' + a['id'] + '.json',
                           'reason': a.get('manual_reason')} for a in manifest['assets']]}
     (job / 'delivery.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -802,7 +969,7 @@ def main():
     p.add_argument('--job', required=True)
     p.add_argument('--workers', type=int, default=5, help='Positive concurrency limit; default 5')
     p.add_argument('--processing', choices=['local-first', 'builtin-repair'], default='local-first',
-                   help='Local scripts by default; image tool only for explicit completion candidates')
+                   help='Local scripts by default; explicit completion or portrait mode may use image tools')
     p.set_defaults(run=build)
     p = sub.add_parser('inventory')
     p.add_argument('--input', nargs='+', required=True)
@@ -832,6 +999,11 @@ def main():
     p.add_argument('--decision', choices=['accept', 'reject'], required=True)
     p.add_argument('--note', required=True)
     p.set_defaults(run=review)
+    p = sub.add_parser('portrait-layout')
+    p.add_argument('--job', required=True)
+    p.add_argument('--id', required=True)
+    p.add_argument('--layout', required=True, help='Vision-provided head polygon and upper-body crop JSON')
+    p.set_defaults(run=portrait_layout)
     p = sub.add_parser('repaired')
     p.add_argument('--job', required=True)
     p.add_argument('--id', required=True)

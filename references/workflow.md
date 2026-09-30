@@ -7,7 +7,9 @@
 # 可显式提供 Python 3.12 路径：./scripts/bootstrap.ps1 -Python C:/Python312/python.exe
 ```
 
-脚本自动创建 `.venv`、安装固定版本、检查依赖并运行三套离线测试（self-test、test_workflow.py、test_parallel.py）；失败立即停止。后续以下命令中的 `python` 均替换为仓库下 `.venv/Scripts/python.exe`。非 Windows 环境用 Python 3.12 执行 `python -m venv .venv`、`.venv/bin/python -m pip install -r requirements.txt` 及这三套测试。固定的是库版本；任务还记录实际 Python/平台/脚本哈希，不承诺跨平台逐字节重算一致。
+脚本自动创建 `.venv`、安装固定版本、检查依赖并运行四套离线测试（self-test、test_workflow.py、test_parallel.py、test_portrait.py）；失败立即停止。后续以下命令中的 `python` 均替换为仓库下 `.venv/Scripts/python.exe`。非 Windows 环境用 Python 3.12 执行 `python -m venv .venv`、`.venv/bin/python -m pip install -r requirements.txt` 及这四套测试。固定的是库版本；任务还记录实际 Python/平台/脚本哈希，不承诺跨平台逐字节重算一致。
+
+用户明确要求人像抠图或上半身构图时，按 [人像接口](portrait.md) 设置 portrait=true、选择提取/补全及执行 portrait-layout。人像可在 local-first 下进行必要的 B/extract 或 B/complete；已有透明人像支持 A/native-alpha。该例外不改变普通素材路由。
 
 ## 自动发现与计划
 
@@ -52,7 +54,7 @@ python scripts/asset_job.py review --job 任务目录 --id source_001_ring --dec
 
 build 不调用内置工具。`--workers` 接受正整数，默认 5，新任务在 manifest 保存 `max_parallel`；本地候选由线程池处理，实际线程数不超过候选数量，主线程按原计划顺序汇总并保存任务记录。每次新建任务避免覆盖旧来源。计划参数无效时拒绝建任务；非处理错误仍为 ERROR，不混同人工判断。
 
-`--processing` 默认 `local-first`，记录在 manifest：对非 complete 候选统一设置 repair_allowed=false，普通提取或复核失败转人工，不调用图片模型；未提供本地提取指导的 B/extract 保存为人工任务并说明原因。B/complete 仅在用户已明确要求遮挡补全时建立，保留计划中原有权限，不能覆盖 repair_allowed=false。另一选项 `builtin-repair` 仅在用户明确选择生成式分离/修补路线时使用，恢复历史 A 失败可进 B、B/extract 可调用工具的行为；bright-background 失败仍转人工。旧任务没有 processing 字段时不自动迁移或改变行为。
+`--processing` 默认 `local-first`，记录在 manifest：对普通非 complete 候选设置 repair_allowed=false，普通提取或复核失败转人工，不调用图片模型；未提供本地提取指导的普通 B/extract 保存为人工任务并说明原因。B/complete 仅在用户已明确要求遮挡补全时建立；明确人像请求则按 portrait.md 执行必要的分离/补全，两者都不能覆盖 repair_allowed=false。另一选项 `builtin-repair` 仅在用户明确选择一般生成式分离/修补路线时使用，恢复历史 A 失败可进 B、B/extract 可调用工具的行为；普通 bright-background 失败仍转人工。旧任务没有 processing 字段时不自动迁移或改变行为。
 
 ## 并发调度
 
@@ -68,7 +70,7 @@ repair-start 在文件锁内读取最新状态、检查名额和两次请求上�
 
 ## 内置工具调用与结果导入
 
-本节仅用于用户明确要求的 B/complete，或明确选择 builtin-repair 的任务。local-first 普通提取失败不进入此队列。
+本节仅用于用户明确要求的 B/complete、人像分离/补全，或明确选择 builtin-repair 的任务。local-first 普通素材提取失败不进入此队列。
 
 例如用户要求补全被叶片遮挡的贝壳，额外建立 `source_001_shell_complete`，设置 route=B、repair_mode=complete 和具体 repair_prompt；仍按计划的 repair_allowed 执行。不要把“主体被遮挡”自动理解为补全授权。
 
