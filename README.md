@@ -1,6 +1,6 @@
 # Design Asset Extractor
 
-自动发现图片中的可复用设计素材，并按 A/B/C 分流处理：A 本地提取，B 调用 Codex 内置图片工具分离或补全，C 保留人工任务。最终输出经过透明通道检查和原图、浅底、深底视觉复核的 PNG。
+大模型看图识别素材、定位并提供提取参数，Python 脚本批量并行分离原像素、生成 Alpha、预览和透明 PNG，再由 Codex 复核。默认使用本地提取，普通提取失败保留人工任务；只有明确要求遮挡补全或选择生成式修补时才调用内置图片工具。
 
 ## 适合什么场景
 
@@ -13,17 +13,21 @@
 
 安装本 Skill 后，直接提供一张图片或一个图片文件夹，并说：
 
-> 使用 `$design-asset-extractor` 自动发现素材、按 A/B/C 分流，并用内置图片工具修补，检查后交付透明 PNG。
+> 使用 `$design-asset-extractor` 看图识别素材，用本地脚本批量提取，最多 5 个一起处理，检查后交付透明 PNG。
 
-用户不需要手写坐标、JSON 或蒙版。Codex 负责看图、发现候选、建立计划、调用工具、导入结果和复核。
+用户不需要手写坐标、JSON 或蒙版。Codex 负责类别、bbox、背景采样及前景/背景点，脚本负责按计划提取和输出 PNG。当前本地方法包括均匀背景 matte、完整矩形照片 crop、浅色背景深色主体 bright-background，不包含通用语义分割模型或额外模型下载。
+
+默认 `build --workers 5 --processing local-first`，脚本按实际候选数量并行处理，最多 5 项；可以说“最多 3 个一起处理”，或用 `--workers 3` 设置正整数上限。Codex 主动分发 subagent 做发现与复核，完成一项继续下一项，单项直接处理。子 agent 默认继承主 agent 模型，发现与复核受宿主 agent 名额限制；本地线程池独立于 agent 数量，不为每个素材发起图片生成。
 
 ## 处理原则
 
 1. 先保留来源、坐标和源文件哈希。
-2. A 路线先检查真实提取结果，再加透明外边距；普通失败且允许修补时进 B，严格模式与 bright-background 失败进 C。
-3. B 路线每个候选单独请求，最多两次，并保留每次提示词、回图和复核记录。
+2. A 路线根据模型提供的方法和参数提取原像素，先检查结果再加透明外边距；默认失败进 C。
+3. B/complete 仅在明确要求遮挡补全时使用，生成式候选最多两次请求；明确选择 `--processing builtin-repair` 才使用历史生成式分离/修补路线。
 4. C 路线不强行重绘，保存人工任务和原因。
 5. 透明 PNG 必须通过 Alpha、边缘和视觉检查后才能交付。
+
+主 agent 合并独立发现计划并统一运行脚本，worker 复核各自素材，任务记录通过文件锁保护。必要的生成式补全按素材 ID 与尝试编号导入；未知结果继续占用名额并等待恢复，避免重复请求或串图。复杂透明、反射或本地方法无法可靠分离的复杂背景转人工，不承诺所有图片都能自动抠图。
 
 内置图片工具没有暴露模型选择参数，因此运行记录不会虚构 Images 2.5 或其他具体模型名称。生成式补全是合理重建，不是恢复原图中不可见的像素。
 
@@ -33,6 +37,7 @@
 - `references/workflow.md`：任务目录、计划和命令接口
 - `scripts/asset_job.py`：任务构建、导入、复核和报告脚本
 - `scripts/test_workflow.py`：离线工作流验证
+- `scripts/test_parallel.py`：容量、竞争及乱序结果的离线验证
 - `docs/`：实施与验证报告
 - `promo/`：基于真实运行结果制作的宣传图和实测素材
 
@@ -46,7 +51,9 @@ V2 海报中的实测素材使用真实 Skill 输出嵌入，贝壳不可见区�
 
 ## 实测结果
 
-当前公开示例包含：
+新版默认路线实测：几何原图的 5 个素材全部由本地脚本提取并通过深浅背景复核，图片生成调用为 0；build 耗时约 0.94 秒，不包含模型识别和视觉复核时间。并发、结果关联与兼容性测试见 [2026-09-30 验证报告](docs/local-first-parallel-validation-2026-09-30.md)。
+
+当前公开示例包含历史提取与内置图片工具案例，不能代表所有素材都走当前默认本地模式：
 
 - 几何素材图：14 个透明 PNG 输出通过视觉复核，包含渐变圆、箭头、圆环、阶梯等。
 - 贝壳案例：真实内置图片工具调用得到 1274 × 1235 透明 PNG，并完成原图、浅底、深底对照。
@@ -61,12 +68,13 @@ V2 海报中的实测素材使用真实 Skill 输出嵌入，贝壳不可见区�
 ./scripts/bootstrap.ps1
 ```
 
-后续使用 `.venv/Scripts/python.exe`。Codex 按 SKILL.md 自动看图、建计划、分流、调用图片工具、复核，直到完成或遇到明确阻塞。`status` 给出下一步，`finalize` 生成交付清单及哈希索引，`verify` 在复制任务目录后检查已保存产物。只有 PASS 计为可交付素材，人工项附任务图和原因。
+后续使用 `.venv/Scripts/python.exe`。Codex 按 SKILL.md 看图与提供参数，脚本批量本地提取，再执行原图和深浅底复核，直到完成或明确阻塞；需要时才调用已授权的图片补全。`status` 给出下一步，`finalize` 生成交付清单及哈希索引，`verify` 在复制任务目录后检查产物。只有 PASS 计为可交付素材，人工项附任务图和原因。
 
 生成一套可检查的离线合成样例：
 
 ```powershell
 ./.venv/Scripts/python.exe scripts/test_workflow.py --output outputs/offline-demo
+./.venv/Scripts/python.exe scripts/test_parallel.py --output outputs/parallel-demo
 ./.venv/Scripts/python.exe scripts/asset_job.py verify --job outputs/offline-demo/synthetic-workflow
 ```
 

@@ -1,4 +1,4 @@
-"""Candidate discovery handoff, A/B/C routing, built-in image repair and review."""
+"""Vision-guided parallel local extraction, optional completion and review."""
 import argparse
 import hashlib
 import json
@@ -7,12 +7,78 @@ import re
 import tempfile
 import shutil
 import platform
+import errno
+import time
+from contextlib import contextmanager
+from functools import wraps
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 import PIL
+
+
+@contextmanager
+def job_lock(path):
+    """OS releases this lock even when a CLI process is interrupted."""
+    job = Path(path).resolve()
+    with (job / '.job.lock').open('a+b') as handle:
+        if handle.seek(0, 2) == 0:
+            handle.write(b'0')
+            handle.flush()
+        if platform.system() == 'Windows':
+            import msvcrt
+
+            def lock(unlock=False):
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            def lock(unlock=False):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                lock()
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Job busy; retry the local command, not the image request') from exc
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            lock(unlock=True)
+
+
+def locked_job(function):
+    @wraps(function)
+    def run(args):
+        with job_lock(args.job):
+            return function(args)
+    return run
+
+
+def repair_capacity(manifest):
+    limit = manifest.get('max_parallel', 1)
+    active = sum(a['status'] in ('REPAIRING', 'REPAIR_BLOCKED') for a in manifest['assets'])
+    return {'max_parallel': limit, 'active': active, 'available_slots': max(0, limit - active)}
+
+
+def active_repairs(manifest):
+    tasks = []
+    for a in manifest['assets']:
+        if a['status'] in ('REPAIRING', 'REPAIR_BLOCKED'):
+            attempt = a.get('repair_attempts', [{}])[-1]
+            tasks.append({'id': a['id'], 'status': a['status'], 'attempt': attempt.get('number'),
+                          'worker': attempt.get('worker'), 'started_at': attempt.get('started_at'),
+                          'tool_reference': attempt.get('tool_reference'), 'error': attempt.get('error')})
+    return tasks
 
 
 def environment():
@@ -281,60 +347,86 @@ def validate_plan(plan, base):
     return sources
 
 
+def build_candidate(job, candidate):
+    # Workers own unique asset files; only the build thread writes the manifest.
+    a = dict(candidate, status='ERROR', generated_repair=bool(candidate.get('generated_source', False)))
+    a.setdefault('initial_route', a['route'])
+    try:
+        crop = read_image(job / 'source' / f"{a['source_id']}.png").crop(a['bbox'])
+        crop.save(job / 'candidates' / f"{a['id']}.png")
+        a['candidate_sha256'] = digest(job / 'candidates' / f"{a['id']}.png")
+        if a['route'] == 'AUTO':
+            points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('background_points', [])]
+            fg_points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('foreground_points', [])]
+            process(job, a, crop, a.get('background_rgb'), points, fg_points)
+        elif a['route'] == 'MANUAL' or not a.get('repair_allowed', True):
+            manual(job, a, a['reason'] if a['route'] == 'MANUAL' else 'Generative repair disabled')
+        else:
+            crop.save(job / 'review_image2' / f"{a['id']}.png")
+            text = f"# {a['label']} ({a['id']})\n\n来源：../source/{a['source_id']}.png\n\n原因：{a['reason']}\n"
+            text += '\n' + repair_prompt(a) + '\n\n默认由 Codex 调用内置图片工具，回图通过 repair-result 导入并验收。\n'
+            (job / 'review_image2' / f"{a['id']}.md").write_text(text, encoding='utf-8')
+            a['status'] = 'WAITING_REPAIR'
+    except Exception as exc:
+        a.update(status='ERROR', error=str(exc))
+        if (isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True)
+                and a.get('extraction_method') != 'bright-background'
+                and (job / 'candidates' / f"{a['id']}.png").exists()):
+            a.update(route='IMAGE2', status='WAITING_REPAIR', repair_mode='extract',
+                     routing_history=[{'from': 'AUTO', 'to': 'IMAGE2', 'reason': str(exc)}])
+        elif isinstance(exc, ValueError) and a['route'] == 'AUTO' and (job / 'candidates' / f"{a['id']}.png").exists():
+            manual(job, a, 'Local extraction failed; no generative fallback: ' + str(exc))
+    return a
+
+
 def build(args):
+    workers = getattr(args, 'workers', 5)
+    if type(workers) is not int or workers < 1:
+        raise ValueError('workers must be a positive integer')
+    processing = getattr(args, 'processing', 'local-first')
+    if processing not in ('local-first', 'builtin-repair'):
+        raise ValueError('processing must be local-first or builtin-repair')
     plan_path = Path(args.plan).resolve()
     plan = json.loads(plan_path.read_text(encoding='utf-8-sig'))
     sources = validate_plan(plan, plan_path.parent)
+    for a in plan['candidates']:
+        a['initial_route'] = a['route']
+        if processing == 'local-first' and not (a['route'] == 'IMAGE2' and a.get('repair_mode') == 'complete'):
+            a['repair_allowed'] = False
+            if a['route'] == 'IMAGE2':
+                reason = 'Local extraction guidance unavailable; generative extraction disabled in local-first'
+                a.update(route='MANUAL', reason=a['reason'] + '; ' + reason,
+                         routing_history=[{'from': 'IMAGE2', 'to': 'MANUAL', 'reason': reason}])
     job = Path(args.job).resolve()
     job.mkdir(parents=True, exist_ok=False)
-    for name in ['source', 'candidates', 'masks', 'review', 'previews', 'assets', 'review_image2', 'manual', 'rejected', 'repaired']:
-        (job / name).mkdir()
-    manifest = {'schema_version': 2, 'method': 'codex-discovery-routing-builtin-repair',
-                'environment': environment(), 'plan_sha256': digest(plan_path),
-                'discovery': plan.get('discovery', {'provider': 'codex-vision', 'coverage': 'not independently measured'}),
-                'sources': [], 'assets': []}
-    shutil.copyfile(plan_path, job / 'plan.json')
-    for sid, (path, size) in sources.items():
-        read_image(path).save(job / 'source' / f'{sid}.png')
-        manifest['sources'].append({'id': sid, 'original_path': str(path), 'sha256': digest(path), 'size': list(size)})
-        manifest['sources'][-1]['snapshot_sha256'] = digest(job / 'source' / f'{sid}.png')
-    for candidate in plan['candidates']:
-        a = dict(candidate, status='ERROR', generated_repair=bool(candidate.get('generated_source', False)))
-        a['initial_route'] = a['route']
-        manifest['assets'].append(a)
-        try:
-            crop = read_image(job / 'source' / f"{a['source_id']}.png").crop(a['bbox'])
-            crop.save(job / 'candidates' / f"{a['id']}.png")
-            a['candidate_sha256'] = digest(job / 'candidates' / f"{a['id']}.png")
-            if a['route'] == 'AUTO':
-                points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('background_points', [])]
-                fg_points = [(x - a['bbox'][0], y - a['bbox'][1]) for x, y in a.get('foreground_points', [])]
-                process(job, a, crop, a.get('background_rgb'), points, fg_points)
-            elif a['route'] == 'MANUAL' or not a.get('repair_allowed', True):
-                manual(job, a, a['reason'] if a['route'] == 'MANUAL' else 'Generative repair disabled')
-            else:
-                folder = 'review_image2' if a['route'] == 'IMAGE2' else 'manual'
-                crop.save(job / folder / f"{a['id']}.png")
-                text = f"# {a['label']} ({a['id']})\n\n来源：../source/{a['source_id']}.png\n\n原因：{a['reason']}\n"
-                if a['route'] == 'IMAGE2':
-                    text += '\n' + repair_prompt(a) + '\n\n默认由 Codex 调用内置图片工具，回图通过 repair-result 导入并验收。\n'
-                (job / folder / f"{a['id']}.md").write_text(text, encoding='utf-8')
-                a['status'] = 'WAITING_REPAIR' if a['route'] == 'IMAGE2' else 'MANUAL'
-        except Exception as exc:
-            a.update(status='ERROR', error=str(exc))
-            if (isinstance(exc, ValueError) and a['route'] == 'AUTO' and a.get('repair_allowed', True)
-                    and a.get('extraction_method') != 'bright-background'
-                    and (job / 'candidates' / f"{a['id']}.png").exists()):
-                a.update(route='IMAGE2', status='WAITING_REPAIR', repair_mode='extract',
-                         routing_history=[{'from': 'AUTO', 'to': 'IMAGE2', 'reason': str(exc)}])
-            elif isinstance(exc, ValueError) and a['route'] == 'AUTO' and (job / 'candidates' / f"{a['id']}.png").exists():
-                manual(job, a, 'Local extraction failed; no generative fallback: ' + str(exc))
+    with job_lock(job):
+        for name in ['source', 'candidates', 'masks', 'review', 'previews', 'assets', 'review_image2', 'manual', 'rejected', 'repaired']:
+            (job / name).mkdir()
+        manifest = {'schema_version': 2, 'method': 'codex-discovery-routing-builtin-repair',
+                    'max_parallel': workers, 'processing': processing, 'created_at': datetime.now(timezone.utc).isoformat(),
+                    'environment': environment(), 'plan_sha256': digest(plan_path),
+                    'discovery': plan.get('discovery', {'provider': 'codex-vision', 'coverage': 'not independently measured'}),
+                    'sources': [], 'assets': [dict(a, status='ERROR', error='Local processing not completed')
+                                             for a in plan['candidates']]}
+        shutil.copyfile(plan_path, job / 'plan.json')
+        for sid, (path, size) in sources.items():
+            read_image(path).save(job / 'source' / f'{sid}.png')
+            manifest['sources'].append({'id': sid, 'original_path': str(path), 'sha256': digest(path), 'size': list(size),
+                                        'snapshot_sha256': digest(job / 'source' / f'{sid}.png')})
         save_manifest(job, manifest)
-    contact_sheet(job, manifest)
-    print(json.dumps({'job': str(job), 'counts': manifest['counts']}, ensure_ascii=False))
-    return 1 if manifest['counts']['ERROR'] else 0
+        local_workers = min(workers, len(plan['candidates']))
+        with ThreadPoolExecutor(max_workers=local_workers) as pool:
+            futures = {pool.submit(build_candidate, job, a): i for i, a in enumerate(plan['candidates'])}
+            for future in as_completed(futures):
+                manifest['assets'][futures[future]] = future.result()
+                save_manifest(job, manifest)
+        contact_sheet(job, manifest)
+        print(json.dumps({'job': str(job), 'counts': manifest['counts'], 'local_workers': local_workers,
+                          'capacity': repair_capacity(manifest)}, ensure_ascii=False))
+        return 1 if manifest['counts']['ERROR'] else 0
 
 
+@locked_job
 def review(args):
     job, manifest = load_job(args.job)
     if not args.note.strip():
@@ -384,8 +476,11 @@ def review(args):
     return 0
 
 
+@locked_job
 def repaired(args):
     job, manifest = load_job(args.job)
+    if 'max_parallel' in manifest:
+        raise ValueError('New jobs require repair-start and repair-result --attempt; repaired is legacy-only')
     identifier(args.id)
     a = next(a for a in manifest['assets'] if a['id'] == args.id)
     if a['status'] != 'WAITING_REPAIR':
@@ -442,6 +537,7 @@ def repair_prompt(asset):
             ('\n上次未通过原因：' + asset['repair_feedback'] if asset.get('repair_feedback') else ''))
 
 
+@locked_job
 def repair_queue(args):
     job, manifest = load_job(args.job)
     tasks = []
@@ -451,36 +547,47 @@ def repair_queue(args):
                           'model': None, 'attempts_used': len(a.get('repair_attempts', [])),
                           'referenced_image_paths': [str(job / 'candidates' / f"{a['id']}.png")],
                           'prompt': repair_prompt(a)})
-    print(json.dumps({'tasks': tasks, 'unresolved': [a['id'] for a in manifest['assets']
+    print(json.dumps({'tasks': tasks, 'processing': manifest.get('processing', 'builtin-repair'),
+                'capacity': repair_capacity(manifest), 'active_tasks': active_repairs(manifest),
+                'unresolved': [a['id'] for a in manifest['assets']
                 if a['status'] in ('REPAIRING', 'REPAIR_BLOCKED')]}, ensure_ascii=False, indent=2))
     return 0
 
 
+@locked_job
 def repair_start(args):
     job, manifest = load_job(args.job)
     a = next(a for a in manifest['assets'] if a['id'] == args.id)
     attempts = a.setdefault('repair_attempts', [])
     if a['status'] != 'WAITING_REPAIR' or len(attempts) >= 2 or not a.get('repair_allowed', True):
         raise ValueError('Not queued, unresolved request, or two-attempt limit reached')
+    if not repair_capacity(manifest)['available_slots']:
+        raise ValueError('Parallel capacity full; finish or recover existing requests first')
     candidate = job / 'candidates' / f"{a['id']}.png"
     if a.get('candidate_sha256') and digest(candidate) != a['candidate_sha256']:
         raise ValueError('Candidate changed after build')
     attempts.append({'number': len(attempts) + 1, 'provider': 'builtin-image-tool', 'model': None,
+                     'worker': getattr(args, 'worker', 'main'),
                      'reference_sha256': digest(candidate),
                      'prompt': repair_prompt(a), 'status': 'IN_FLIGHT',
                      'started_at': datetime.now(timezone.utc).isoformat()})
     a['status'] = 'REPAIRING'
     save_manifest(job, manifest)
-    print(json.dumps({'id': a['id'], 'attempt': attempts[-1]['number'], 'prompt': attempts[-1]['prompt']}, ensure_ascii=False))
+    print(json.dumps({'id': a['id'], 'attempt': attempts[-1]['number'], 'prompt': attempts[-1]['prompt'],
+                      'referenced_image_paths': [str(candidate)]}, ensure_ascii=False))
     return 0
 
 
+@locked_job
 def repair_result(args):
     job, manifest = load_job(args.job)
     a = next(a for a in manifest['assets'] if a['id'] == args.id)
     if a['status'] not in ('REPAIRING', 'REPAIR_BLOCKED') or not a.get('repair_attempts'):
         raise ValueError('Start/resume a recorded repair before importing its result')
     attempt = a['repair_attempts'][-1]
+    number = getattr(args, 'attempt', None)
+    if ('max_parallel' in manifest and number is None) or (number is not None and number != attempt['number']):
+        raise ValueError('Missing or stale attempt number; use the original repair-start result')
     if args.failure:
         # An uncertain provider outcome must not cause a duplicate external request.
         attempt.update(status='BLOCKED', error=args.failure)
@@ -501,6 +608,7 @@ def repair_result(args):
     attempt.update(status='RECEIVED', original_path=str(original), sha256=digest(original),
                    artifact_path=str(dest.relative_to(job)), artifact_sha256=digest(dest),
                    model=args.model, tool_reference=args.tool_reference)
+    attempt.setdefault('received_at', datetime.now(timezone.utc).isoformat())
     a.update(generated_repair=True, provider='builtin-image-tool')
     save_manifest(job, manifest)
     try:
@@ -526,6 +634,7 @@ def repair_result(args):
     return 0
 
 
+@locked_job
 def status(args):
     job, manifest = load_job(args.job)
     actions = []
@@ -535,7 +644,8 @@ def status(args):
             action = ('resume review with recorded decision and note' if a.get('pending_review') else
                       'view preview, then review accept/reject with observations')
         elif state == 'WAITING_REPAIR':
-            action = 'view candidate, repair-start, call image_gen once, repair-result'
+            action = ('view candidate, repair-start to reserve a slot, call image_gen once, repair-result with attempt'
+                      if repair_capacity(manifest)['available_slots'] else 'wait for capacity; recover blocked requests')
         elif state in ('REPAIRING', 'REPAIR_BLOCKED'):
             action = 'recover original tool result; do not dispatch again'
         elif state in ('ERROR', 'REJECTED'):
@@ -548,10 +658,13 @@ def status(args):
                         'pending_review': a.get('pending_review'),
                         'error': a.get('error')})
     print(json.dumps({'job': str(job), 'counts': manifest['counts'],
+                      'processing': manifest.get('processing', 'builtin-repair'),
+                      'capacity': repair_capacity(manifest), 'active_tasks': active_repairs(manifest),
                       'ready_to_finalize': not actions, 'actions': actions}, ensure_ascii=False, indent=2))
     return 0
 
 
+@locked_job
 def finalize(args):
     """Only resolved jobs are deliveries. A checksum index allows offline replay."""
     job, manifest = load_job(args.job)
@@ -584,6 +697,8 @@ def finalize(args):
             if handoff.get('id') != a['id'] or handoff.get('status') != 'MANUAL':
                 raise ValueError('Invalid manual handoff: ' + a['id'])
     report = {'environment': manifest.get('environment'), 'discovery': manifest.get('discovery'), 'counts': manifest['counts'],
+              'processing': manifest.get('processing', 'builtin-repair'),
+              'max_parallel': manifest.get('max_parallel', 1),
               'local_pass': sum(a['status'] == 'PASS' and not a['generated_repair'] for a in manifest['assets']),
               'generated_pass': sum(a['status'] == 'PASS' and a['generated_repair'] for a in manifest['assets']),
               'assets': [{'id': a['id'], 'label': a['label'], 'status': a['status'],
@@ -592,12 +707,13 @@ def finalize(args):
                           'reason': a.get('manual_reason')} for a in manifest['assets']]}
     (job / 'delivery.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     index = {str(p.relative_to(job).as_posix()): digest(p) for p in sorted(job.rglob('*'))
-             if p.is_file() and p.name != 'checksums.json'}
+             if p.is_file() and p.name != 'checksums.json' and p != job / '.job.lock'}
     (job / 'checksums.json').write_text(json.dumps(index, indent=2), encoding='utf-8')
     print(json.dumps({'delivery': str(job / 'delivery.json'), 'files': len(index), 'counts': manifest['counts']}))
     return 0
 
 
+@locked_job
 def verify(args):
     job = Path(args.job).resolve()
     index = json.loads((job / 'checksums.json').read_text(encoding='utf-8'))
@@ -644,9 +760,14 @@ def self_test():
         pp = root / 'plan.json'
         pp.write_text(json.dumps(plan), encoding='utf-8')
         job = root / 'job'
-        assert build(argparse.Namespace(plan=pp, job=job)) == 0
+        assert build(argparse.Namespace(plan=pp, job=job, processing='builtin-repair')) == 0
         assert not list((job / 'assets').iterdir()), 'No automatic PASS'
         review(argparse.Namespace(job=job, id=['ring'], decision='accept', note='Synthetic ring checked'))
+        # Exercise the historical hand-import path using an old-format job.
+        with job_lock(job):
+            _, legacy = load_job(job)
+            legacy.pop('max_parallel')
+            save_manifest(job, legacy)
         repaired(argparse.Namespace(job=job, id='repair', input=root / 'source.png', background=[248, 245, 238], point=[[50, 50]]))
         review(argparse.Namespace(job=job, id=['repair'], decision='reject', note='Exercise rejection'))
         _, m = load_job(job)
@@ -679,6 +800,9 @@ def main():
     p = sub.add_parser('build')
     p.add_argument('--plan', required=True)
     p.add_argument('--job', required=True)
+    p.add_argument('--workers', type=int, default=5, help='Positive concurrency limit; default 5')
+    p.add_argument('--processing', choices=['local-first', 'builtin-repair'], default='local-first',
+                   help='Local scripts by default; image tool only for explicit completion candidates')
     p.set_defaults(run=build)
     p = sub.add_parser('inventory')
     p.add_argument('--input', nargs='+', required=True)
@@ -690,10 +814,12 @@ def main():
     p = sub.add_parser('repair-start')
     p.add_argument('--job', required=True)
     p.add_argument('--id', required=True)
+    p.add_argument('--worker', default='main', help='Worker/agent label for tracing the request')
     p.set_defaults(run=repair_start)
     p = sub.add_parser('repair-result')
     p.add_argument('--job', required=True)
     p.add_argument('--id', required=True)
+    p.add_argument('--attempt', type=int, help='Required for new jobs; number returned by repair-start')
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument('--input')
     group.add_argument('--failure')

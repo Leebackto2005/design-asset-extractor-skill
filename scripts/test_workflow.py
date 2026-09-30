@@ -18,6 +18,12 @@ def ns(**kw):
     return argparse.Namespace(**kw)
 
 
+def result_args(**kw):
+    _, manifest = j.load_job(kw['job'])
+    asset = next(a for a in manifest['assets'] if a['id'] == kw['id'])
+    return ns(attempt=asset['repair_attempts'][-1]['number'], **kw)
+
+
 def main():
     card = Image.new('RGBA', (40, 30), (123, 80, 20, 255))
     padded = j.local_extract(card, 'crop', 8)
@@ -54,7 +60,7 @@ def main():
         pp = root / 'plan.json'
         pp.write_text(json.dumps(plan), encoding='utf-8')
         job = root / 'job'
-        j.build(ns(plan=pp, job=job))
+        j.build(ns(plan=pp, job=job, processing='builtin-repair'))
         _, m = j.load_job(job)
         assert m['assets'][0]['status'] == 'WAITING_REPAIR', 'Padding hid a clipped target'
         assert m['assets'][1]['status'] == 'MANUAL', 'Strict clipping must stay local/manual'
@@ -79,7 +85,7 @@ def main():
                                dict(b, id='a', route='A', background_rgb=[0, 0, 0]), dict(b, id='c', route='C')]}
         (root / 'plan.json').write_text(json.dumps(plan), encoding='utf-8')
         job = root / 'job'
-        assert j.build(ns(plan=root / 'plan.json', job=job)) == 0
+        assert j.build(ns(plan=root / 'plan.json', job=job, processing='builtin-repair')) == 0
         _, m = j.load_job(job)
         assert m['assets'][3]['initial_route'] == 'AUTO' and m['assets'][3]['status'] == 'WAITING_REPAIR'
         assert m['assets'][4]['status'] == 'MANUAL'
@@ -96,7 +102,7 @@ def main():
                 pass
             else:
                 raise AssertionError('Duplicate dispatch allowed')
-            assert j.repair_result(ns(job=job, id='b', failure=None, input=root / 'native.png', model=None, tool_reference=None)) == 0
+            assert j.repair_result(result_args(job=job, id='b', failure=None, input=root / 'native.png', model=None, tool_reference=None)) == 0
             assert np.array_equal(np.asarray(native), np.asarray(j.read_image(job / 'review' / 'b.png')))
             j.review(ns(job=job, id=['b'], decision='reject' if attempt == 0 else 'accept', note='Synthetic test observation; no model call'))
         _, m = j.load_job(job)
@@ -107,12 +113,12 @@ def main():
         assert len(list((job / 'repaired').glob('b-attempt-*.png'))) == 2
         for _ in range(2):
             j.repair_start(ns(job=job, id='opaque'))
-            assert j.repair_result(ns(job=job, id='opaque', failure=None, input=root / 'source.png', model=None, tool_reference=None)) == 1
+            assert j.repair_result(result_args(job=job, id='opaque', failure=None, input=root / 'source.png', model=None, tool_reference=None)) == 1
         _, m = j.load_job(job)
         assert m['assets'][1]['status'] == 'MANUAL'
         j.repair_start(ns(job=job, id='blocked'))
-        assert j.repair_result(ns(job=job, id='blocked', failure='Unknown external result', input=None)) == 2
-        assert j.repair_result(ns(job=job, id='blocked', failure=None, input=root / 'native.png', model=None, tool_reference='recovered')) == 0
+        assert j.repair_result(result_args(job=job, id='blocked', failure='Unknown external result', input=None)) == 2
+        assert j.repair_result(result_args(job=job, id='blocked', failure=None, input=root / 'native.png', model=None, tool_reference='recovered')) == 0
         _, m = j.load_job(job)
         assert len(m['assets'][2]['repair_attempts']) == 1
         assert m['counts']['PASS'] == 1 and not (job / 'assets' / 'opaque.png').exists()
@@ -128,7 +134,7 @@ def main():
         # Inject an interruption after the received artifact has been saved.
         with patch.object(j, 'preview', side_effect=OSError('simulated preview interruption')):
             try:
-                j.repair_result(ns(job=job, id='a', failure=None, input=root / 'native.png', model=None, tool_reference='offline'))
+                j.repair_result(result_args(job=job, id='a', failure=None, input=root / 'native.png', model=None, tool_reference='offline'))
             except OSError:
                 pass
             else:
@@ -137,12 +143,12 @@ def main():
         changed.putpixel((30, 30), (1, 2, 3, 255))
         changed.save(root / 'changed.png')
         try:
-            j.repair_result(ns(job=job, id='a', failure=None, input=root / 'changed.png', model=None, tool_reference='offline'))
+            j.repair_result(result_args(job=job, id='a', failure=None, input=root / 'changed.png', model=None, tool_reference='offline'))
         except ValueError:
             pass
         else:
             raise AssertionError('A different image replaced existing attempt')
-        j.repair_result(ns(job=job, id='a', failure=None, input=root / 'native.png', model=None, tool_reference='offline'))
+        j.repair_result(result_args(job=job, id='a', failure=None, input=root / 'native.png', model=None, tool_reference='offline'))
         j.review(ns(job=job, id=['a'], decision='accept', note='Synthetic recovery checked'))
         j.finalize(ns(job=job))
         j.verify(ns(job=job))
@@ -154,7 +160,7 @@ def main():
                               dict(strict, id='rejected', route='A', background_rgb=[246, 244, 238])]
         (root / 'strict.json').write_text(json.dumps(plan), encoding='utf-8')
         strict_job = root / 'strict-job'
-        j.build(ns(plan=root / 'strict.json', job=strict_job))
+        j.build(ns(plan=root / 'strict.json', job=strict_job, processing='builtin-repair'))
         j.review(ns(job=strict_job, id=['rejected'], decision='reject', note='Strict synthetic rejection'))
         _, m = j.load_job(strict_job)
         assert m['counts']['MANUAL'] == 3
@@ -178,7 +184,7 @@ def main():
                               dict(strict, id='reject_resume', route='A', background_rgb=[246, 244, 238])]
         (root / 'resume.json').write_text(json.dumps(plan), encoding='utf-8')
         resume_job = root / 'review-resume'
-        j.build(ns(plan=root / 'resume.json', job=resume_job))
+        j.build(ns(plan=root / 'resume.json', job=resume_job, processing='builtin-repair'))
         for aid, decision in [('accept_resume', 'accept'), ('reject_resume', 'reject')]:
             original_save = j.save_manifest
 

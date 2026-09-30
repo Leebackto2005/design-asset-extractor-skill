@@ -24,4 +24,6 @@ $env:PYTHONUTF8 = '1'
 if ($LASTEXITCODE -ne 0) { throw 'Self-test failed' }
 & $runner (Join-Path $PSScriptRoot 'test_workflow.py')
 if ($LASTEXITCODE -ne 0) { throw 'Workflow test failed' }
+& $runner (Join-Path $PSScriptRoot 'test_parallel.py')
+if ($LASTEXITCODE -ne 0) { throw 'Parallel workflow test failed' }
 Write-Output "READY: $runner"
